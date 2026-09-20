@@ -722,11 +722,21 @@ pub(crate) fn discord_message_to_raw(
 /// self-triggering (PLAN §3, `Trigger`). Mention detection reads the literal
 /// `<@id>` / `<@!id>` markup Discord puts in `content`, which is also why the
 /// `MESSAGE_CONTENT` intent matters (FINDINGS, "MESSAGE_CONTENT").
+///
+/// A message that parses as an approval answer (`1`, or `<uuid> 1`) is also a
+/// trigger: Discord's `accept` runs *before* the gateway's `answer_question`
+/// interception, so without this a numbered reply would be dropped as
+/// "not_triggered" and the parked approval could never be answered. The
+/// gateway still routes a stray number with no pending question to the agent,
+/// exactly as iMessage already does.
 pub(crate) fn is_triggered(message: &RawMessage, bot_user_id: Option<&str>) -> bool {
     if message.voice.is_some() {
         return true;
     }
     if message.text.trim_start().starts_with('!') {
+        return true;
+    }
+    if crate::approval::parse_answer(&message.text).is_some() {
         return true;
     }
     bot_user_id.is_some_and(|bot| mentions_user(&message.text, bot))
@@ -2236,6 +2246,15 @@ mod tests {
         assert!(!is_triggered(&user_message("hey <@420> not me"), bot));
         assert!(is_triggered(&user_message("!x"), None));
         assert!(!is_triggered(&user_message("mention <@42> here"), None));
+
+        // An approval answer must survive `accept` (which runs before the
+        // gateway's answer interception): a bare number or `<uuid> <number>`.
+        assert!(is_triggered(&user_message("1"), bot));
+        assert!(is_triggered(
+            &user_message("55c4c4fe-c768-4a9b-9842-13f245a9a341 2"),
+            bot
+        ));
+        assert!(!is_triggered(&user_message("not a number"), bot));
 
         let mut voice = user_message("");
         voice.voice = Some(InboundVoice {
