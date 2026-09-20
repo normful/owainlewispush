@@ -1533,18 +1533,23 @@ impl DiscordChannel {
         if !content.is_empty() {
             body.insert("content".to_string(), json!(content));
         }
-        body.insert(
-            "attachments".to_string(),
-            json!([{
-                "id": upload.id,
-                "filename": attachment.filename,
-                "uploaded_filename": upload.upload_filename
-            }]),
-        );
+        let mut attachment_json = json!({
+            "id": upload.id,
+            "filename": attachment.filename,
+            "uploaded_filename": upload.upload_filename
+        });
+        // Discord requires a voice message's `duration_secs` and `waveform`
+        // *inside* the attachment object; putting them at the message top level
+        // is answered with 50161 "Voice messages must have supporting
+        // metadata". Verified against the spike payload
+        // (`spikes/voice-loop/voice_loop.py`) and the API reference.
         if let Some(voice) = &attachment.voice {
+            attachment_json["duration_secs"] = json!(voice.duration_secs);
+            attachment_json["waveform"] = json!(voice.waveform);
+        }
+        body.insert("attachments".to_string(), json!([attachment_json]));
+        if attachment.voice.is_some() {
             body.insert("flags".to_string(), json!(VOICE_MESSAGE_FLAG));
-            body.insert("duration_secs".to_string(), json!(voice.duration_secs));
-            body.insert("waveform".to_string(), json!(voice.waveform));
         }
         let message_url = self.url(&format!("/channels/{}/messages", self.channel_id));
         let posted = self
@@ -2362,11 +2367,11 @@ mod tests {
                     "attachments": [{
                         "id": "7",
                         "filename": "reply.ogg",
-                        "uploaded_filename": "uuid/reply.ogg"
+                        "uploaded_filename": "uuid/reply.ogg",
+                        "duration_secs": 3.5,
+                        "waveform": "AAAA"
                     }],
-                    "flags": 8192,
-                    "duration_secs": 3.5,
-                    "waveform": "AAAA"
+                    "flags": 8192
                 })
             )
         );
@@ -2561,11 +2566,11 @@ mod tests {
                     "attachments": [{
                         "id": 0,
                         "filename": "reply.ogg",
-                        "uploaded_filename": "u/reply.ogg"
+                        "uploaded_filename": "u/reply.ogg",
+                        "duration_secs": 2.5,
+                        "waveform": "AAAA"
                     }],
-                    "flags": 8192,
-                    "duration_secs": 2.5,
-                    "waveform": "AAAA"
+                    "flags": 8192
                 })
             )
         );

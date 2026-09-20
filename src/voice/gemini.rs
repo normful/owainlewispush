@@ -301,8 +301,13 @@ impl GeminiVoice {
                     );
                 }
                 Err(error) => {
-                    eprintln!("gemini live synthesis failed: {error:#}");
-                    break;
+                    // A transient Live failure (closed socket, empty audio)
+                    // should not cost the reply its voice; retry once before
+                    // falling back, matching the divergence path above.
+                    eprintln!(
+                        "gemini live synthesis failed (attempt {}): {error:#}",
+                        attempt + 1
+                    );
                 }
             }
         }
