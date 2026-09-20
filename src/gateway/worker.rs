@@ -1079,7 +1079,7 @@ fn conversation_prompt(
     } else {
         Vec::new()
     };
-    Ok(composer.conversation(
+    let mut prompt = composer.conversation(
         ctx.channel.id(),
         &job.thread,
         if job.reply_with_voice {
@@ -1089,6 +1089,26 @@ fn conversation_prompt(
         },
         &messages,
         &job.text,
+    );
+    if let Some(prompt_file) = job.prompt_file.as_deref() {
+        prompt
+            .instructions
+            .push_str(&channel_instructions(&ctx.cfg.assistant_dir, prompt_file)?);
+    }
+    Ok(prompt)
+}
+
+/// Reads a per-channel system-prompt file (PLAN §3) and renders it as a
+/// system-instruction section. The path is validated at config load to stay a
+/// plain relative path under `assistant_root`.
+pub(super) fn channel_instructions(assistant_dir: &str, prompt_file: &str) -> Result<String> {
+    let prompt_file = prompt_file.trim();
+    let path = std::path::Path::new(assistant_dir).join(prompt_file);
+    let content = std::fs::read_to_string(&path)
+        .with_context(|| format!("read channel prompt file {}", path.display()))?;
+    Ok(format!(
+        "\n\n# Channel instructions ({prompt_file})\n\n{}",
+        content.trim_end()
     ))
 }
 

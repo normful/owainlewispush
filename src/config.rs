@@ -549,6 +549,7 @@ impl Config {
             backend: self.agent_backend()?,
             model: None,
             thinking: None,
+            prompt_file: None,
         })
     }
 
@@ -608,6 +609,7 @@ impl Config {
             backend: AgentBackend::parse(&route.agent)?,
             model: route.model.clone(),
             thinking: route.thinking.clone(),
+            prompt_file: route.prompt_file.clone(),
         })
     }
 
@@ -777,6 +779,30 @@ impl Config {
             }
             if route.model.as_deref().is_some_and(|m| m.trim().is_empty()) {
                 bail!("route model cannot be empty");
+            }
+            if let Some(prompt_file) = route.prompt_file.as_deref() {
+                let prompt_file = prompt_file.trim();
+                if prompt_file.is_empty() {
+                    bail!("route prompt_file cannot be empty");
+                }
+                let path = Path::new(prompt_file);
+                if path.is_absolute()
+                    || path
+                        .components()
+                        .any(|component| !matches!(component, Component::Normal(_)))
+                {
+                    bail!(
+                        "route prompt_file {prompt_file:?} must be a plain relative path inside assistant_root"
+                    );
+                }
+                let root = resolved_absolute("assistant_root", Path::new(&self.assistant_root))?;
+                let resolved = root.join(path);
+                if !resolved.is_file() {
+                    bail!(
+                        "route prompt_file {prompt_file:?} does not exist under assistant_root ({})",
+                        resolved.display()
+                    );
+                }
             }
         }
         let poll_active = self.poll_interval_dur()?;
@@ -970,6 +996,10 @@ pub struct RouteRule {
     /// Per-channel Pi thinking level (PLAN §3). `None` uses the CLI default.
     #[serde(default)]
     pub thinking: Option<String>,
+    /// Per-channel system-prompt file, relative to `assistant_root`, appended to
+    /// the system instructions for this channel's runs (PLAN §3).
+    #[serde(default)]
+    pub prompt_file: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
@@ -983,6 +1013,7 @@ pub struct RouteSelection {
     pub backend: AgentBackend,
     pub model: Option<String>,
     pub thinking: Option<String>,
+    pub prompt_file: Option<String>,
 }
 
 impl RouteRule {
@@ -1406,6 +1437,7 @@ mod tests {
         cfg.agent = "pi".to_string();
         cfg.jobs_agent = Some("pi".to_string());
         cfg.routes = vec![RouteRule {
+            prompt_file: None,
             model: None,
             thinking: None,
             thread: Some("imessage:chat:pi".to_string()),
@@ -1457,6 +1489,7 @@ mod tests {
         assert_eq!(cfg.required_agent_bins().unwrap(), vec!["codex"]);
 
         cfg.routes.push(RouteRule {
+            prompt_file: None,
             model: None,
             thinking: None,
             thread: None,
@@ -1552,6 +1585,7 @@ mod tests {
         cfg.discord_base_url = Some("discord.int.exe.xyz".to_string());
         cfg.discord_allow_channel_ids = vec!["900".to_string(), "901".to_string()];
         cfg.routes = vec![RouteRule {
+            prompt_file: None,
             thread: None,
             channel: Some("discord:901".to_string()),
             agent: "pi".to_string(),
@@ -1590,5 +1624,47 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("only supported for the pi backend"));
+    }
+
+    #[test]
+    fn route_prompt_file_must_be_relative_and_exist_under_assistant_root() {
+        let mut cfg = config();
+        cfg.agent = "pi".to_string();
+        cfg.jobs_agent = Some("pi".to_string());
+        cfg.discord_base_url = Some("discord.int.exe.xyz".to_string());
+        cfg.discord_channel_id = Some("900".to_string());
+        cfg.discord_allow_channel_ids = vec!["900".to_string()];
+
+        let root = std::path::PathBuf::from(&cfg.assistant_root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("main.md"), "Be terse.\n").unwrap();
+
+        cfg.routes = vec![RouteRule {
+            thread: None,
+            channel: Some("discord:900".to_string()),
+            agent: "pi".to_string(),
+            model: None,
+            thinking: None,
+            prompt_file: Some("main.md".to_string()),
+        }];
+        cfg.validate().unwrap();
+
+        cfg.routes[0].prompt_file = Some("missing.md".to_string());
+        assert!(cfg
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("does not exist under assistant_root"));
+
+        for escape in ["../secret.md", "/etc/passwd", "sub/../x.md"] {
+            cfg.routes[0].prompt_file = Some(escape.to_string());
+            assert!(
+                cfg.validate()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("plain relative path"),
+                "{escape}"
+            );
+        }
     }
 }

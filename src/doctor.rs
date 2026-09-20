@@ -733,6 +733,7 @@ claude_tools = []
         cfg.telegram_bot_token = Some("secret".to_string());
         cfg.telegram_allow_user_ids = vec![7];
         cfg.routes = vec![config::RouteRule {
+            prompt_file: None,
             model: None,
             thinking: None,
             thread: None,

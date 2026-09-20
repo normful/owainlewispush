@@ -239,6 +239,7 @@ fn setup_failure_ctx(
 
 fn setup_failure_job(row_id: i64) -> Job {
     Job {
+        prompt_file: None,
         model: None,
         thinking: None,
         row_id,
@@ -672,6 +673,7 @@ async fn fake_channel_e2e_replies_once_ignores_unallowlisted_and_reuses_session(
         assistant_dir.to_str().unwrap(),
     );
     cfg.routes = vec![crate::config::RouteRule {
+        prompt_file: None,
         model: None,
         thinking: None,
         thread: Some("imessage:dm:+15551234567".to_string()),
@@ -1184,6 +1186,7 @@ async fn backend_switch_and_clear_start_fresh_sessions_with_history() {
     )
     .await;
     gateway.cfg.routes = vec![crate::config::RouteRule {
+        prompt_file: None,
         model: None,
         thinking: None,
         thread: Some("imessage:dm:+15551234567".to_string()),
@@ -2792,6 +2795,7 @@ async fn closed_worker_queue_is_recovered_without_another_message() {
         .unwrap();
     gateway.ack.lock().unwrap().in_flight.insert(1);
     let lost_job = Job {
+        prompt_file: None,
         model: None,
         thinking: None,
         row_id: 1,
@@ -3104,6 +3108,7 @@ async fn stop_targets_the_current_row_ahead_of_retained_failures() {
     .unwrap();
     let thread = "imessage:self:me@icloud.com";
     let make_job = |row_id, inbound_id, text: &str| Job {
+        prompt_file: None,
         model: None,
         thinking: None,
         row_id,
@@ -4213,4 +4218,21 @@ fn poll_backoff_steps_idle_then_snaps_back_on_traffic() {
     assert_eq!(backoff.next(), secs(2));
     backoff.record(false);
     assert_eq!(backoff.next(), secs(30));
+}
+
+#[test]
+fn channel_prompt_file_is_rendered_as_a_system_instruction_section() {
+    let dir = crate::test_support::temp_dir("channel-prompt");
+    std::fs::write(dir.join("main.md"), "Never mention the weather.\n").unwrap();
+
+    let rendered = super::worker::channel_instructions(dir.to_str().unwrap(), "main.md").unwrap();
+    assert!(rendered.contains("# Channel instructions (main.md)"));
+    assert!(rendered.contains("Never mention the weather."));
+    assert!(rendered.ends_with("Never mention the weather."));
+
+    let missing = super::worker::channel_instructions(dir.to_str().unwrap(), "nope.md");
+    assert!(missing
+        .unwrap_err()
+        .to_string()
+        .contains("read channel prompt file"));
 }

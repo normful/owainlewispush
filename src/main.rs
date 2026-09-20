@@ -1482,6 +1482,7 @@ allow_user_ids = [7]
         cfg.agent = "claude".to_string();
         cfg.routes = vec![
             config::RouteRule {
+                prompt_file: None,
                 model: None,
                 thinking: None,
                 thread: None,
@@ -1489,6 +1490,7 @@ allow_user_ids = [7]
                 agent: "codex".to_string(),
             },
             config::RouteRule {
+                prompt_file: None,
                 model: None,
                 thinking: None,
                 thread: Some("telegram:dm:7".to_string()),
@@ -1496,6 +1498,7 @@ allow_user_ids = [7]
                 agent: "claude".to_string(),
             },
             config::RouteRule {
+                prompt_file: None,
                 model: None,
                 thinking: None,
                 thread: Some("telegram:dm:7:topic:99".to_string()),
@@ -1503,6 +1506,7 @@ allow_user_ids = [7]
                 agent: "codex".to_string(),
             },
             config::RouteRule {
+                prompt_file: None,
                 model: None,
                 thinking: None,
                 thread: Some("self:me@icloud.com".to_string()),
@@ -1510,6 +1514,7 @@ allow_user_ids = [7]
                 agent: "codex".to_string(),
             },
             config::RouteRule {
+                prompt_file: None,
                 model: None,
                 thinking: None,
                 thread: Some("imessage:self:me@icloud.com".to_string()),

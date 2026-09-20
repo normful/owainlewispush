@@ -42,6 +42,8 @@ struct Job {
     /// Per-channel model/thinking resolved by the route (PLAN §3).
     model: Option<String>,
     thinking: Option<String>,
+    /// Per-channel system-prompt file relative to assistant_root (PLAN §3).
+    prompt_file: Option<String>,
     text: String,
     reply_with_voice: bool,
     voice_attachment: Option<InboundVoice>,
@@ -918,6 +920,7 @@ impl Gateway {
                     backend,
                     model: route.model,
                     thinking: route.thinking,
+                    prompt_file: route.prompt_file,
                     text: message_text,
                     reply_with_voice,
                     voice_attachment: m.voice.clone(),
