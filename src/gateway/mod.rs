@@ -236,6 +236,53 @@ impl GatewayGroup {
         Ok(destination)
     }
 
+    /// Cancels approval questions left pending by a previous process and tells
+    /// each origin: the parked rpc run did not survive the restart, so the
+    /// question cannot be resumed (DESIGN §4). Without this a stale pending row
+    /// would linger and a late numbered reply would answer a dead run.
+    async fn recover_pending_questions(&self) {
+        let pending = {
+            let Some(gateway) = self.gateways.first() else {
+                return;
+            };
+            match gateway.ctx.history.lock().unwrap().pending_questions() {
+                Ok(pending) => pending,
+                Err(error) => {
+                    warn!("approval restart recovery could not read pending questions: {error:#}");
+                    return;
+                }
+            }
+        };
+        for question in pending {
+            let Some(gateway) = self.gateways.iter().find(|gateway| {
+                gateway.channel.store_key() == question.thread_key
+                    || gateway.channel.id() == question.channel
+            }) else {
+                continue;
+            };
+            if let Err(error) = gateway
+                .ctx
+                .history
+                .lock()
+                .unwrap()
+                .cancel_question(&question.id, now_ms())
+            {
+                warn!(
+                    "could not cancel pending approval {}: {error:#}",
+                    question.id
+                );
+                continue;
+            }
+            let notice = "The assistant restarted before that request was approved, so it was cancelled. Ask again if you still want it.";
+            if !reply_to(&gateway.ctx, &question.target, notice).await {
+                warn!(
+                    "approval restart notice delivery failed for {}",
+                    question.id
+                );
+            }
+        }
+    }
+
     pub async fn run(self) -> Result<()> {
         self.run_until(shutdown_signal()).await
     }
@@ -259,6 +306,7 @@ impl GatewayGroup {
             .iter()
             .map(|gateway| (gateway.channel.store_key(), gateway.ctx.clone()))
             .collect::<HashMap<_, _>>();
+        self.recover_pending_questions().await;
         // Every channel shares one pool, so one janitor reaps idle children for
         // the whole group (DESIGN §1). Only meaningful in rpc mode.
         let pool = if self.cfg.pi_rpc_enabled() {

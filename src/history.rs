@@ -15,6 +15,16 @@ use crate::approval::{
 
 const SCHEMA_VERSION: i64 = 14;
 const RETIRED_JOB_APPROVAL_ERROR: &str = "job approval was removed; request direct job creation";
+
+/// A pending approval question, used for startup recovery (DESIGN §4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingQuestion {
+    pub id: String,
+    pub channel: String,
+    pub thread_key: String,
+    pub target: String,
+}
+
 const MAX_HISTORY_READ_BYTES: usize = 8 * 1024;
 const READ_TRUNCATED: &str = "\n[truncated by push while reading history]";
 
@@ -584,6 +594,23 @@ impl History {
             .optional()?
             .map(|status| QuestionState::parse(&status))
             .transpose()
+    }
+
+    /// Every still-pending approval question, for startup recovery (DESIGN §4).
+    pub fn pending_questions(&self) -> Result<Vec<PendingQuestion>> {
+        let mut statement = self.conn.prepare(
+            "SELECT id, channel, thread_key, target FROM approval_questions
+             WHERE status = 'pending'",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok(PendingQuestion {
+                id: row.get(0)?,
+                channel: row.get(1)?,
+                thread_key: row.get(2)?,
+                target: row.get(3)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
     pub fn cancel_question(&mut self, id: &str, now_ms: i64) -> Result<bool> {
@@ -1364,6 +1391,29 @@ mod tests {
                 .unwrap(),
             AnswerOutcome::Duplicate(question.id.clone())
         );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn pending_questions_lists_and_cancels_for_startup_recovery() {
+        let path = temp_path("approval-recovery");
+        let mut history = History::open(path.to_str().unwrap()).unwrap();
+        let first = question(20_000);
+        let second = question(20_000);
+        history.create_question(&first, 1_000).unwrap();
+        history.create_question(&second, 1_000).unwrap();
+
+        let pending = history.pending_questions().unwrap();
+        assert_eq!(pending.len(), 2);
+        let listed = pending.iter().find(|q| q.id == first.id).unwrap();
+        assert_eq!(listed.channel, "telegram");
+        assert_eq!(listed.thread_key, "telegram:dm:7:topic:9");
+        assert_eq!(listed.target, "7:9");
+
+        assert!(history.cancel_question(&first.id, 1_100).unwrap());
+        let pending = history.pending_questions().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id, second.id);
         let _ = std::fs::remove_file(path);
     }
 
