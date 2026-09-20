@@ -108,6 +108,7 @@ impl Pool {
         prompt: &str,
         timeout: Duration,
         handler: &mut dyn UiHandler,
+        delta_sink: Option<&tokio::sync::mpsc::Sender<super::rpc::Delta>>,
     ) -> Result<RunOutput, RunError> {
         let (mut session, session_id) = self.acquire(key, &spec, timeout).await?;
         // The guard forgets this thread's entry if the run future is dropped
@@ -118,7 +119,7 @@ impl Pool {
             armed: true,
         };
 
-        let outcome = match session.turn(prompt, timeout, handler).await {
+        let outcome = match session.turn(prompt, timeout, handler, delta_sink).await {
             Ok(outcome) => outcome,
             Err(error) => {
                 guard.armed = false;
@@ -451,6 +452,7 @@ done
                 "one",
                 Duration::from_secs(5),
                 &mut CancelHandler,
+                None,
             )
             .await
             .unwrap();
@@ -461,6 +463,7 @@ done
                 "two",
                 Duration::from_secs(5),
                 &mut CancelHandler,
+                None,
             )
             .await
             .unwrap();
@@ -491,6 +494,7 @@ done
             "one",
             Duration::from_secs(5),
             &mut CancelHandler,
+            None,
         )
         .await
         .unwrap();
@@ -520,6 +524,7 @@ done
             "one",
             Duration::from_secs(5),
             &mut CancelHandler,
+            None,
         )
         .await
         .unwrap();
@@ -537,6 +542,7 @@ done
                     "two",
                     Duration::from_secs(5),
                     &mut CancelHandler,
+                    None,
                 )
                 .await
             })
@@ -568,6 +574,7 @@ done
                 "hello",
                 Duration::from_secs(5),
                 &mut CancelHandler,
+                None,
             )
             .await
             .unwrap();
@@ -580,6 +587,7 @@ done
             "hello",
             Duration::from_secs(5),
             &mut CancelHandler,
+            None,
         )
         .await
         .unwrap();
@@ -605,6 +613,7 @@ done
                 "one",
                 Duration::from_secs(5),
                 &mut CancelHandler,
+                None,
             )
             .await
             .unwrap_err();

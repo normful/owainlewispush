@@ -1299,6 +1299,7 @@ async fn dispatch(
             &prompt.content,
             ctx.run_timeout,
             &mut handler,
+            None,
         )
         .await
 }

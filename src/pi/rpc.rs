@@ -36,6 +36,7 @@ use anyhow::{Context, Result};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+use tokio::sync::mpsc;
 
 /// Malformed lines tolerated before a run is declared broken, so a hostile or
 /// corrupt stream cannot spin the read loop forever.
@@ -130,6 +131,52 @@ impl UiHandler for CancelHandler {
     fn handle<'a>(&'a mut self, _request: &'a UiRequest) -> UiFuture<'a> {
         Box::pin(async { UiResponse::Cancelled })
     }
+}
+
+/// One advisory chunk of streamed assistant text (DESIGN §5). The stream is
+/// lossy on crash; [`TurnOutcome::text`] is authoritative.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Delta {
+    pub text: String,
+    /// True when this delta ends a sentence (or is the end-of-turn flush).
+    pub boundary: bool,
+}
+
+/// Emits every complete sentence from `pending`, leaving any trailing fragment
+/// for the caller (or the next delta) to finish.
+fn emit_sentences(pending: &mut String, sink: &mpsc::Sender<Delta>) {
+    while let Some(end) = sentence_boundary(pending) {
+        let sentence = pending[..end].trim().to_string();
+        *pending = pending[end..].to_string();
+        if !sentence.is_empty() {
+            let _ = sink.try_send(Delta {
+                text: sentence,
+                boundary: true,
+            });
+        }
+    }
+}
+
+/// Byte offset just past a sentence boundary, or `None` when the buffer holds
+/// only a fragment. A boundary is a newline, or `.`/`!`/`?` followed by
+/// whitespace; a trailing punctuation mark with nothing after it is left for the
+/// end-of-turn flush.
+fn sentence_boundary(text: &str) -> Option<usize> {
+    for (index, ch) in text.char_indices() {
+        if ch == '\n' {
+            return Some(index + 1);
+        }
+        if matches!(ch, '.' | '!' | '?') {
+            let after = index + ch.len_utf8();
+            let next = text[after..].chars().next();
+            match next {
+                Some(n) if n.is_whitespace() => return Some(after + n.len_utf8()),
+                Some(_) => {}
+                None => return None,
+            }
+        }
+    }
+    None
 }
 
 /// One completed rpc turn.
@@ -278,11 +325,13 @@ impl Session {
         prompt: &str,
         timeout: Duration,
         handler: &mut dyn UiHandler,
+        delta_sink: Option<&mpsc::Sender<Delta>>,
     ) -> Result<TurnOutcome> {
         self.send(&json!({"type": "prompt", "message": prompt}))
             .await?;
         let mut skipped = 0usize;
         let mut delta_chars = 0usize;
+        let mut pending = String::new();
         let mut ui_requests = Vec::new();
         let mut last_message_end: Option<String> = None;
         let mut asked_for_final = false;
@@ -324,6 +373,10 @@ impl Session {
                             .and_then(Value::as_str)
                         {
                             delta_chars += delta.chars().count();
+                            if let Some(sink) = delta_sink {
+                                pending.push_str(delta);
+                                emit_sentences(&mut pending, sink);
+                            }
                         }
                     }
                 }
@@ -389,6 +442,16 @@ impl Session {
                         .map(str::to_string)
                         .or(last_message_end.take())
                         .unwrap_or_default();
+                    // Flush any trailing sentence the boundary scan held back.
+                    if let Some(sink) = delta_sink {
+                        let remainder = pending.trim();
+                        if !remainder.is_empty() {
+                            let _ = sink.try_send(Delta {
+                                text: remainder.to_string(),
+                                boundary: true,
+                            });
+                        }
+                    }
                     break Ok(TurnOutcome {
                         text,
                         delta_chars,
@@ -554,7 +617,7 @@ done
             }
         });
         let outcome = session
-            .turn("do the thing", Duration::from_secs(5), &mut handler)
+            .turn("do the thing", Duration::from_secs(5), &mut handler, None)
             .await
             .unwrap();
 
@@ -584,7 +647,7 @@ done
         session.init(Duration::from_secs(5)).await.unwrap();
         let mut handler = CancelHandler;
         let outcome = session
-            .turn("go", Duration::from_secs(5), &mut handler)
+            .turn("go", Duration::from_secs(5), &mut handler, None)
             .await
             .unwrap();
         assert_eq!(outcome.text, "hello from gate");
@@ -626,5 +689,57 @@ done
             UiResponse::Cancelled,
             "an exhausted queue cancels a select"
         );
+    }
+
+    /// A fake that streams three deltas and reports the same text as its final.
+    const FAKE_DELTAS: &str = r#"#!/bin/sh
+while IFS= read -r line; do
+  case "$line" in
+    *"get_state"*)
+      printf '%s\n' '{"type":"response","command":"get_state","id":"push-state","data":{"sessionId":"s1"}}'
+      ;;
+    *"get_last_assistant_text"*)
+      printf '%s\n' '{"type":"response","command":"get_last_assistant_text","id":"push-final","data":{"text":"One. Two! Three"}}'
+      ;;
+    *'"type":"prompt"'*)
+      printf '%s\n' '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"One. "}}'
+      printf '%s\n' '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"Two! "}}'
+      printf '%s\n' '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"Three"}}'
+      printf '%s\n' '{"type":"agent_settled"}'
+      ;;
+  esac
+done
+"#;
+
+    /// PLAN §7 step 4: the advisory delta sink emits complete sentences and
+    /// flushes the trailing fragment; the concatenation matches the final text.
+    #[tokio::test]
+    async fn delta_sink_emits_sentences_and_flushes_the_tail() {
+        let cli = FakeCli::new("rpc-sink", FAKE_DELTAS);
+        let mut session = Session::spawn(
+            &cli.bin(),
+            &["--mode".to_string(), "rpc".to_string()],
+            &[],
+            ".",
+        )
+        .unwrap();
+        session.init(Duration::from_secs(5)).await.unwrap();
+
+        let (sink, mut receiver) = mpsc::channel(16);
+        let mut handler = CancelHandler;
+        let outcome = session
+            .turn("go", Duration::from_secs(5), &mut handler, Some(&sink))
+            .await
+            .unwrap();
+        drop(sink);
+
+        let mut sentences = Vec::new();
+        while let Ok(delta) = receiver.try_recv() {
+            assert!(delta.boundary);
+            sentences.push(delta.text);
+        }
+        assert_eq!(sentences, vec!["One.", "Two!", "Three"]);
+        assert_eq!(sentences.join(" "), outcome.text);
+        session.shutdown().await;
     }
 }
