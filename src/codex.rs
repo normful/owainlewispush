@@ -332,6 +332,8 @@ mod tests {
         let out = runner
             .run_unattended(
                 Request {
+                    model: None,
+                    thinking: None,
                     session_id: "",
                     is_new: true,
                     work_dir: work_dir.to_str().unwrap(),
@@ -369,6 +371,8 @@ mod tests {
         let out = runner
             .run_unattended(
                 Request {
+                    model: None,
+                    thinking: None,
                     session_id: "existing-thread",
                     is_new: false,
                     work_dir: work_dir.to_str().unwrap(),
@@ -410,6 +414,8 @@ mod tests {
         runner(new_cli.bin())
             .run(
                 Request {
+                    model: None,
+                    thinking: None,
                     session_id: "",
                     is_new: true,
                     work_dir: work_dir.to_str().unwrap(),
@@ -443,6 +449,8 @@ mod tests {
         runner(resumed_cli.bin())
             .run(
                 Request {
+                    model: None,
+                    thinking: None,
                     session_id: "codex-thread",
                     is_new: false,
                     work_dir: work_dir.to_str().unwrap(),
@@ -510,6 +518,8 @@ mod tests {
         let error = runner
             .run(
                 Request {
+                    model: None,
+                    thinking: None,
                     session_id: "missing",
                     is_new: false,
                     work_dir: work_dir.to_str().unwrap(),
@@ -617,6 +627,8 @@ sleep 2
 
     fn request(work_dir: &str) -> Request<'_> {
         Request {
+            model: None,
+            thinking: None,
             session_id: "",
             is_new: true,
             work_dir,

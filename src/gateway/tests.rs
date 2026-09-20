@@ -239,6 +239,8 @@ fn setup_failure_ctx(
 
 fn setup_failure_job(row_id: i64) -> Job {
     Job {
+        model: None,
+        thinking: None,
         row_id,
         inbound_id: 1,
         thread: "imessage:self:me".to_string(),
@@ -670,6 +672,8 @@ async fn fake_channel_e2e_replies_once_ignores_unallowlisted_and_reuses_session(
         assistant_dir.to_str().unwrap(),
     );
     cfg.routes = vec![crate::config::RouteRule {
+        model: None,
+        thinking: None,
         thread: Some("imessage:dm:+15551234567".to_string()),
         channel: None,
         agent: "codex".to_string(),
@@ -1180,6 +1184,8 @@ async fn backend_switch_and_clear_start_fresh_sessions_with_history() {
     )
     .await;
     gateway.cfg.routes = vec![crate::config::RouteRule {
+        model: None,
+        thinking: None,
         thread: Some("imessage:dm:+15551234567".to_string()),
         channel: None,
         agent: "claude".to_string(),
@@ -2786,6 +2792,8 @@ async fn closed_worker_queue_is_recovered_without_another_message() {
         .unwrap();
     gateway.ack.lock().unwrap().in_flight.insert(1);
     let lost_job = Job {
+        model: None,
+        thinking: None,
         row_id: 1,
         inbound_id: lost_inbound_id,
         thread: thread.to_string(),
@@ -3096,6 +3104,8 @@ async fn stop_targets_the_current_row_ahead_of_retained_failures() {
     .unwrap();
     let thread = "imessage:self:me@icloud.com";
     let make_job = |row_id, inbound_id, text: &str| Job {
+        model: None,
+        thinking: None,
         row_id,
         inbound_id,
         thread: thread.to_string(),

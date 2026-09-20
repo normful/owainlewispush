@@ -293,7 +293,15 @@ where
         );
         let mut result = runner
             .run(
-                backend_request(&session_id, is_new, &work_dir, &prompt, &image_paths),
+                backend_request(
+                    &session_id,
+                    is_new,
+                    &work_dir,
+                    &prompt,
+                    &image_paths,
+                    job.model.as_deref(),
+                    job.thinking.as_deref(),
+                ),
                 ctx.run_timeout,
             )
             .await;
@@ -308,7 +316,15 @@ where
                     })?;
                     result = runner
                         .run(
-                            backend_request(&session_id, false, &work_dir, &prompt, &image_paths),
+                            backend_request(
+                                &session_id,
+                                false,
+                                &work_dir,
+                                &prompt,
+                                &image_paths,
+                                job.model.as_deref(),
+                                job.thinking.as_deref(),
+                            ),
                             ctx.run_timeout,
                         )
                         .await;
@@ -362,7 +378,15 @@ where
             );
             result = runner
                 .run(
-                    backend_request(&session_id, true, &work_dir, &prompt, &image_paths),
+                    backend_request(
+                        &session_id,
+                        true,
+                        &work_dir,
+                        &prompt,
+                        &image_paths,
+                        job.model.as_deref(),
+                        job.thinking.as_deref(),
+                    ),
                     ctx.run_timeout,
                 )
                 .await;
@@ -1074,6 +1098,8 @@ fn backend_request<'a>(
     work_dir: &'a str,
     prompt: &'a ComposedPrompt,
     images: &'a [PathBuf],
+    model: Option<&'a str>,
+    thinking: Option<&'a str>,
 ) -> Request<'a> {
     Request {
         session_id,
@@ -1082,5 +1108,7 @@ fn backend_request<'a>(
         instructions: &prompt.instructions,
         prompt: &prompt.content,
         images,
+        model,
+        thinking,
     }
 }

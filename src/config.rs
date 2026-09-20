@@ -14,6 +14,8 @@ pub const TELEGRAM_BOT_TOKEN_ENV: &str = "TELEGRAM_BOT_TOKEN";
 pub const SLACK_APP_TOKEN_ENV: &str = "SLACK_APP_TOKEN";
 pub const SLACK_BOT_TOKEN_ENV: &str = "SLACK_BOT_TOKEN";
 pub const DEFAULT_VOICE_NAME: &str = "cedar";
+/// Pi's valid `--thinking` levels (kept in sync with the pi CLI).
+const VALID_THINKING_LEVELS: &[&str] = &["off", "minimal", "low", "medium", "high", "xhigh", "max"];
 const SUPPORTED_VOICE_NAMES: &[&str] = &[
     "alloy", "ash", "ballad", "coral", "echo", "fable", "nova", "onyx", "sage", "shimmer", "verse",
     "marin", "cedar",
@@ -528,22 +530,25 @@ impl Config {
     pub fn route_for_message(
         &self,
         channel: &str,
+        channel_instance: &str,
         route_thread_groups: &[Vec<String>],
     ) -> Result<RouteSelection> {
         for aliases in route_thread_groups {
             for route in self.routes.iter().filter(|route| route.thread.is_some()) {
-                if route.matches_threads(channel, aliases) {
+                if route.matches_threads(channel, channel_instance, aliases) {
                     return self.resolve_route(route);
                 }
             }
         }
         for route in self.routes.iter().filter(|route| route.thread.is_none()) {
-            if route.matches(channel) {
+            if route.matches(channel, channel_instance) {
                 return self.resolve_route(route);
             }
         }
         Ok(RouteSelection {
             backend: self.agent_backend()?,
+            model: None,
+            thinking: None,
         })
     }
 
@@ -601,6 +606,8 @@ impl Config {
     fn resolve_route(&self, route: &RouteRule) -> Result<RouteSelection> {
         Ok(RouteSelection {
             backend: AgentBackend::parse(&route.agent)?,
+            model: route.model.clone(),
+            thinking: route.thinking.clone(),
         })
     }
 
@@ -746,8 +753,11 @@ impl Config {
             bail!("jobs_max_workers must be positive");
         }
         for route in &self.routes {
-            AgentBackend::parse(&route.agent)
+            let backend = AgentBackend::parse(&route.agent)
                 .with_context(|| format!("invalid route agent for {route:?}"))?;
+            if (route.model.is_some() || route.thinking.is_some()) && backend != AgentBackend::Pi {
+                bail!("route model/thinking are only supported for the pi backend");
+            }
             if route.thread.is_none() && route.channel.is_none() {
                 bail!("route must set thread or channel");
             }
@@ -756,6 +766,17 @@ impl Config {
             }
             if let Some(channel) = &route.channel {
                 ChannelKind::parse(channel).context("invalid route channel")?;
+            }
+            if let Some(thinking) = route.thinking.as_deref() {
+                if !VALID_THINKING_LEVELS.contains(&thinking.trim()) {
+                    bail!(
+                        "route thinking {thinking:?} must be one of: {}",
+                        VALID_THINKING_LEVELS.join(", ")
+                    );
+                }
+            }
+            if route.model.as_deref().is_some_and(|m| m.trim().is_empty()) {
+                bail!("route model cannot be empty");
             }
         }
         let poll_active = self.poll_interval_dur()?;
@@ -943,6 +964,12 @@ pub struct RouteRule {
     #[serde(default)]
     pub channel: Option<String>,
     pub agent: String,
+    /// Per-channel Pi model pattern (PLAN §3). `None` uses the CLI default.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Per-channel Pi thinking level (PLAN §3). `None` uses the CLI default.
+    #[serde(default)]
+    pub thinking: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
@@ -954,6 +981,8 @@ pub struct PrimaryDeliveryConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RouteSelection {
     pub backend: AgentBackend,
+    pub model: Option<String>,
+    pub thinking: Option<String>,
 }
 
 impl RouteRule {
@@ -961,8 +990,15 @@ impl RouteRule {
         self.channel.as_deref().is_none_or(|value| value == channel)
     }
 
-    fn matches_threads(&self, channel: &str, threads: &[String]) -> bool {
-        if !self.can_match_channel(channel) {
+    /// A route matches by provider kind (`"discord"`) or by the concrete
+    /// channel instance (`"discord:900"`), so a per-guild-channel route can
+    /// carry its own model/thinking (PLAN §3).
+    fn matches_channel_or_instance(&self, channel: &str, instance: &str) -> bool {
+        self.can_match_channel(channel) || self.can_match_channel(instance)
+    }
+
+    fn matches_threads(&self, channel: &str, instance: &str, threads: &[String]) -> bool {
+        if !self.matches_channel_or_instance(channel, instance) {
             return false;
         }
         self.thread
@@ -970,8 +1006,8 @@ impl RouteRule {
             .is_some_and(|value| threads.iter().any(|thread| value == thread))
     }
 
-    fn matches(&self, channel: &str) -> bool {
-        self.can_match_channel(channel) && self.thread.is_none()
+    fn matches(&self, channel: &str, instance: &str) -> bool {
+        self.matches_channel_or_instance(channel, instance) && self.thread.is_none()
     }
 }
 
@@ -1370,6 +1406,8 @@ mod tests {
         cfg.agent = "pi".to_string();
         cfg.jobs_agent = Some("pi".to_string());
         cfg.routes = vec![RouteRule {
+            model: None,
+            thinking: None,
             thread: Some("imessage:chat:pi".to_string()),
             channel: Some("imessage".to_string()),
             agent: "pi".to_string(),
@@ -1380,9 +1418,13 @@ mod tests {
         assert_eq!(cfg.agent_backend().unwrap(), AgentBackend::Pi);
         assert_eq!(cfg.jobs_backend().unwrap(), AgentBackend::Pi);
         assert_eq!(
-            cfg.route_for_message("imessage", &[vec!["imessage:chat:pi".to_string()]])
-                .unwrap()
-                .backend,
+            cfg.route_for_message(
+                "imessage",
+                "imessage",
+                &[vec!["imessage:chat:pi".to_string()]]
+            )
+            .unwrap()
+            .backend,
             AgentBackend::Pi
         );
         assert_eq!(cfg.required_agent_bins().unwrap(), vec!["pi"]);
@@ -1415,6 +1457,8 @@ mod tests {
         assert_eq!(cfg.required_agent_bins().unwrap(), vec!["codex"]);
 
         cfg.routes.push(RouteRule {
+            model: None,
+            thinking: None,
             thread: None,
             channel: Some("telegram".to_string()),
             agent: "pi".to_string(),
@@ -1497,5 +1541,54 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("poll_interval <= poll_idle_interval <= poll_max_interval"));
+    }
+
+    #[test]
+    fn route_can_carry_model_and_thinking_for_a_guild_channel() {
+        let mut cfg = config();
+        cfg.agent = "pi".to_string();
+        cfg.jobs_agent = Some("pi".to_string());
+        cfg.channels = vec!["discord:900".to_string(), "discord:901".to_string()];
+        cfg.discord_base_url = Some("discord.int.exe.xyz".to_string());
+        cfg.discord_allow_channel_ids = vec!["900".to_string(), "901".to_string()];
+        cfg.routes = vec![RouteRule {
+            thread: None,
+            channel: Some("discord:901".to_string()),
+            agent: "pi".to_string(),
+            model: Some("gemini-3.8-live-extended-thinking".to_string()),
+            thinking: Some("high".to_string()),
+        }];
+        cfg.validate().unwrap();
+
+        // The route matches the concrete guild channel, not just the kind.
+        let selected = cfg
+            .route_for_message("discord", "discord:901", &[vec!["discord:901".to_string()]])
+            .unwrap();
+        assert_eq!(
+            selected.model.as_deref(),
+            Some("gemini-3.8-live-extended-thinking")
+        );
+        assert_eq!(selected.thinking.as_deref(), Some("high"));
+
+        // A different guild channel falls through to the CLI defaults.
+        let other = cfg
+            .route_for_message("discord", "discord:900", &[vec!["discord:900".to_string()]])
+            .unwrap();
+        assert_eq!(other.model, None);
+        assert_eq!(other.thinking, None);
+
+        // Thinking must be a valid pi level.
+        let mut bad = cfg.clone();
+        bad.routes[0].thinking = Some("very-high".to_string());
+        assert!(bad.validate().unwrap_err().to_string().contains("thinking"));
+
+        // model/thinking belong to the pi backend only.
+        let mut non_pi = cfg.clone();
+        non_pi.routes[0].agent = "codex".to_string();
+        assert!(non_pi
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("only supported for the pi backend"));
     }
 }

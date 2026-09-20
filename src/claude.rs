@@ -411,6 +411,8 @@ mod tests {
         let out = runner
             .run_unattended(
                 Request {
+                    model: None,
+                    thinking: None,
                     session_id: "push-session",
                     is_new: true,
                     work_dir: work_dir.to_str().unwrap(),
@@ -454,6 +456,8 @@ mod tests {
         let out = runner
             .run_unattended(
                 Request {
+                    model: None,
+                    thinking: None,
                     session_id: "existing-session",
                     is_new: false,
                     work_dir: work_dir.to_str().unwrap(),
@@ -551,6 +555,8 @@ mod tests {
             let output = runner
                 .run(
                     Request {
+                        model: None,
+                        thinking: None,
                         session_id: if is_new {
                             "new-session"
                         } else {
@@ -791,6 +797,8 @@ printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"d
         let error = runner
             .run(
                 Request {
+                    model: None,
+                    thinking: None,
                     session_id: "missing",
                     is_new: false,
                     work_dir: work_dir.to_str().unwrap(),
@@ -891,6 +899,8 @@ printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"d
 
     fn request(work_dir: &str) -> Request<'_> {
         Request {
+            model: None,
+            thinking: None,
             session_id: "session",
             is_new: true,
             work_dir,

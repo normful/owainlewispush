@@ -39,6 +39,9 @@ struct Job {
     thread: String,
     target: String,
     backend: AgentBackend,
+    /// Per-channel model/thinking resolved by the route (PLAN §3).
+    model: Option<String>,
+    thinking: Option<String>,
     text: String,
     reply_with_voice: bool,
     voice_attachment: Option<InboundVoice>,
@@ -883,7 +886,10 @@ impl Gateway {
                     }
                 };
                 let route_threads = self.channel.route_thread_groups(&thread);
-                let route = match self.cfg.route_for_message(m.channel, &route_threads) {
+                let route = match self
+                    .cfg
+                    .route_for_message(m.channel, &store_key, &route_threads)
+                {
                     Ok(v) => v,
                     Err(e) => {
                         error!("[{thread}] route error: {e}");
@@ -910,6 +916,8 @@ impl Gateway {
                     thread,
                     target,
                     backend,
+                    model: route.model,
+                    thinking: route.thinking,
                     text: message_text,
                     reply_with_voice,
                     voice_attachment: m.voice.clone(),

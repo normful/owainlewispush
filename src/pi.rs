@@ -141,6 +141,16 @@ impl Runner {
             cmd.arg("--append-system-prompt")
                 .arg(req.instructions.trim());
         }
+        if let Some(model) = req.model.map(str::trim).filter(|model| !model.is_empty()) {
+            cmd.arg("--model").arg(model);
+        }
+        if let Some(thinking) = req
+            .thinking
+            .map(str::trim)
+            .filter(|level| !level.is_empty())
+        {
+            cmd.arg("--thinking").arg(thinking);
+        }
         if !req.is_new {
             cmd.arg("--session").arg(req.session_id);
         }
@@ -276,6 +286,8 @@ mod tests {
         let output = runner
             .run(
                 Request {
+                    model: None,
+                    thinking: None,
                     session_id: "",
                     is_new: true,
                     work_dir: work_dir.to_str().unwrap(),
@@ -383,6 +395,8 @@ mod tests {
         let output = runner
             .run(
                 Request {
+                    model: None,
+                    thinking: None,
                     session_id: "pi-session",
                     is_new: false,
                     work_dir: work_dir.to_str().unwrap(),
@@ -400,6 +414,38 @@ mod tests {
         let args = read_args(&args_path);
         assert_arg_pair(&args, "--session", "pi-session");
         assert!(!args.contains(&"--tools".to_string()));
+        assert!(!args.contains(&"--model".to_string()));
+        assert!(!args.contains(&"--thinking".to_string()));
+    }
+
+    #[tokio::test]
+    async fn passes_model_and_thinking_flags_when_set() {
+        let args_path = temp_path("pi-model-args");
+        let work_dir = temp_dir("pi-model-work");
+        let cli = FakeCli::new("pi", &success_script(&args_path, "pi-session", "ok"));
+        let runner = Runner { bin: cli.bin() };
+
+        let output = runner
+            .run(
+                Request {
+                    model: Some("gemini-3.8-live-extended-thinking"),
+                    thinking: Some("high"),
+                    session_id: "",
+                    is_new: true,
+                    work_dir: work_dir.to_str().unwrap(),
+                    instructions: "",
+                    prompt: "hi",
+                    images: &[],
+                },
+                Duration::from_secs(5),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(output.reply, "ok");
+        let args = read_args(&args_path);
+        assert_arg_pair(&args, "--model", "gemini-3.8-live-extended-thinking");
+        assert_arg_pair(&args, "--thinking", "high");
     }
 
     #[tokio::test]
@@ -415,6 +461,8 @@ mod tests {
             let output = runner
                 .run(
                     Request {
+                        model: None,
+                        thinking: None,
                         session_id: if is_new { "" } else { "existing-session" },
                         is_new,
                         work_dir: work_dir.to_str().unwrap(),
@@ -641,6 +689,8 @@ printf '%s\n' '{"type":"message_end","message":{"role":"assistant","content":[{"
 
     fn request(work_dir: &str, is_new: bool) -> Request<'_> {
         Request {
+            model: None,
+            thinking: None,
             session_id: if is_new { "" } else { "existing-session" },
             is_new,
             work_dir,

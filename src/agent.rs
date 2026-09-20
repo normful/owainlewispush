@@ -17,6 +17,10 @@ pub struct Request<'a> {
     pub instructions: &'a str,
     pub prompt: &'a str,
     pub images: &'a [PathBuf],
+    /// Per-channel model pattern (PLAN §3). `None` uses the CLI default.
+    pub model: Option<&'a str>,
+    /// Per-channel thinking level (PLAN §3). `None` uses the CLI default.
+    pub thinking: Option<&'a str>,
 }
 
 /// A completed agent turn.

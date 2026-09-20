@@ -1482,26 +1482,36 @@ allow_user_ids = [7]
         cfg.agent = "claude".to_string();
         cfg.routes = vec![
             config::RouteRule {
+                model: None,
+                thinking: None,
                 thread: None,
                 channel: Some("telegram".to_string()),
                 agent: "codex".to_string(),
             },
             config::RouteRule {
+                model: None,
+                thinking: None,
                 thread: Some("telegram:dm:7".to_string()),
                 channel: None,
                 agent: "claude".to_string(),
             },
             config::RouteRule {
+                model: None,
+                thinking: None,
                 thread: Some("telegram:dm:7:topic:99".to_string()),
                 channel: None,
                 agent: "codex".to_string(),
             },
             config::RouteRule {
+                model: None,
+                thinking: None,
                 thread: Some("self:me@icloud.com".to_string()),
                 channel: None,
                 agent: "codex".to_string(),
             },
             config::RouteRule {
+                model: None,
+                thinking: None,
                 thread: Some("imessage:self:me@icloud.com".to_string()),
                 channel: None,
                 agent: "claude".to_string(),
@@ -1509,19 +1519,20 @@ allow_user_ids = [7]
         ];
 
         assert_eq!(
-            cfg.route_for_message("telegram", &[vec!["telegram:dm:7".to_string()]])
+            cfg.route_for_message("telegram", "telegram", &[vec!["telegram:dm:7".to_string()]])
                 .unwrap()
                 .backend,
             config::AgentBackend::Claude
         );
         assert_eq!(
-            cfg.route_for_message("telegram", &[vec!["telegram:dm:8".to_string()]])
+            cfg.route_for_message("telegram", "telegram", &[vec!["telegram:dm:8".to_string()]])
                 .unwrap()
                 .backend,
             config::AgentBackend::Codex
         );
         assert_eq!(
             cfg.route_for_message(
+                "telegram",
                 "telegram",
                 &[
                     vec!["telegram:dm:7:topic:99".to_string()],
@@ -1535,6 +1546,7 @@ allow_user_ids = [7]
         assert_eq!(
             cfg.route_for_message(
                 "telegram",
+                "telegram",
                 &[
                     vec!["telegram:dm:7:topic:100".to_string()],
                     vec!["telegram:dm:7".to_string()],
@@ -1546,6 +1558,7 @@ allow_user_ids = [7]
         );
         assert_eq!(
             cfg.route_for_message(
+                "imessage",
                 "imessage",
                 &[vec![
                     "imessage:self:me@icloud.com".to_string(),
