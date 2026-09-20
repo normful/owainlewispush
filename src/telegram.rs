@@ -347,6 +347,8 @@ impl Telegram {
             bytes,
             filename: voice.filename.clone(),
             mime_type: voice.mime_type.clone(),
+            duration_secs: None,
+            waveform: None,
         })
     }
 
@@ -1048,6 +1050,8 @@ mod tests {
             bytes: vec![4, 5, 6],
             filename: "reply.opus".to_string(),
             mime_type: "audio/ogg".to_string(),
+            duration_secs: None,
+            waveform: None,
         };
 
         telegram.send_voice("7:99", &clip).await.unwrap();

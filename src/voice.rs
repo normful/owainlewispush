@@ -1,36 +1,38 @@
 //! Provider-neutral voice transcription and speech synthesis.
+//!
+//! The production provider is Gemini (`crate::voice::gemini`); the
+//! `VoiceProvider` boundary keeps the gateway free of provider specifics and
+//! makes the delivery decisions unit-testable.
 #![cfg_attr(test, allow(dead_code))]
 
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::time::Duration;
 
-use anyhow::{bail, Context, Result};
-use reqwest::multipart::{Form, Part};
-use serde::Deserialize;
-use serde_json::json;
+use anyhow::{bail, Result};
 
 use crate::config::Config;
 
-pub const OPENAI_API_KEY_ENV: &str = "OPENAI_API_KEY";
-pub const TRANSCRIPTION_MODEL: &str = "gpt-4o-transcribe";
-pub const SPEECH_MODEL: &str = "gpt-4o-mini-tts";
+mod gemini;
+
+pub use gemini::{DEFAULT_BASE_URL as GEMINI_VOICE_BASE_URL, TRANSCRIPTION_MODEL};
+
 pub const MAX_AUDIO_BYTES: usize = 20 * 1024 * 1024;
 const MAX_SPEECH_CHARS: usize = 4096;
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(90);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum VoiceCredentialSource {
-    Environment,
-    Config,
-}
+/// Speakable budget for a voice reply. At or above this the answer is delivered
+/// as text instead (PLAN §3, Reply modality).
+pub const VOICE_REPLY_MAX_CHARS: usize = 800;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct AudioClip {
     pub bytes: Vec<u8>,
     pub filename: String,
     pub mime_type: String,
+    /// Voice-message metadata, present on synthesized replies (PLAN §6).
+    pub duration_secs: Option<f64>,
+    /// base64 of Discord's 256-sample waveform, present on synthesized replies.
+    pub waveform: Option<String>,
 }
 
 pub(crate) type VoiceFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
@@ -46,33 +48,20 @@ pub struct Voice {
 }
 
 impl Voice {
+    /// The Gemini integration needs no key on the VM (PLAN §2), so voice is
+    /// always available; only a per-call failure falls back to text.
     pub fn from_config(config: &Config) -> Option<Self> {
-        let environment = std::env::var(OPENAI_API_KEY_ENV).ok();
-        Self::from_sources(
-            environment.as_deref(),
-            config.voice_openai_api_key.as_deref(),
-            &config.voice_name,
-        )
-    }
-
-    fn from_sources(
-        environment: Option<&str>,
-        configured: Option<&str>,
-        voice_name: &str,
-    ) -> Option<Self> {
-        let (key, _) = resolve_openai_api_key(environment, configured)?;
+        let base_url = config
+            .voice_gemini_base_url
+            .clone()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| gemini::DEFAULT_BASE_URL.to_string());
         Some(Self {
-            provider: Arc::new(OpenAiVoice::new(key.to_string(), voice_name.to_string())),
+            provider: Arc::new(gemini::GeminiVoice::new(
+                base_url,
+                config.voice_name.clone(),
+            )),
         })
-    }
-
-    pub(crate) fn credential_source(config: &Config) -> Option<VoiceCredentialSource> {
-        let environment = std::env::var(OPENAI_API_KEY_ENV).ok();
-        resolve_openai_api_key(
-            environment.as_deref(),
-            config.voice_openai_api_key.as_deref(),
-        )
-        .map(|(_, source)| source)
     }
 
     #[cfg(test)]
@@ -113,163 +102,47 @@ impl Voice {
     }
 }
 
-fn resolve_openai_api_key<'a>(
-    environment: Option<&'a str>,
-    configured: Option<&'a str>,
-) -> Option<(&'a str, VoiceCredentialSource)> {
-    environment
-        .map(str::trim)
-        .filter(|key| !key.is_empty())
-        .map(|key| (key, VoiceCredentialSource::Environment))
-        .or_else(|| {
-            configured
-                .map(str::trim)
-                .filter(|key| !key.is_empty())
-                .map(|key| (key, VoiceCredentialSource::Config))
-        })
+/// How a reply is delivered: exactly one copy, chosen deterministically
+/// (PLAN §3, Reply modality).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplyModality {
+    Text,
+    Voice,
 }
 
-struct OpenAiVoice {
-    api_key: String,
-    voice_name: String,
-    client: reqwest::Client,
-    base_url: String,
-}
-
-impl OpenAiVoice {
-    fn new(api_key: String, voice_name: String) -> Self {
-        Self {
-            api_key,
-            voice_name,
-            client: reqwest::Client::new(),
-            base_url: "https://api.openai.com/v1".to_string(),
-        }
+/// A typed message always gets text. A voice note gets voice only when the
+/// answer is short enough to listen to and has no construct that renders badly
+/// as speech; otherwise text. Pure, so the rule is unit-testable.
+pub fn select_modality(input_was_voice: bool, answer: &str) -> ReplyModality {
+    if !input_was_voice {
+        return ReplyModality::Text;
     }
-
-    #[cfg(test)]
-    fn with_base_url(api_key: String, base_url: String, voice_name: String) -> Self {
-        Self {
-            api_key,
-            voice_name,
-            client: reqwest::Client::new(),
-            base_url,
-        }
+    if answer.contains("```") || answer.contains("~~~") {
+        return ReplyModality::Text;
     }
-}
-
-impl VoiceProvider for OpenAiVoice {
-    fn transcribe<'a>(&'a self, clip: AudioClip) -> VoiceFuture<'a, String> {
-        Box::pin(async move {
-            let part = Part::bytes(clip.bytes)
-                .file_name(clip.filename)
-                .mime_str(&clip.mime_type)
-                .context("prepare voice message")?;
-            let response = self
-                .client
-                .post(format!("{}/audio/transcriptions", self.base_url))
-                .bearer_auth(&self.api_key)
-                .timeout(REQUEST_TIMEOUT)
-                .multipart(
-                    Form::new()
-                        .text("model", TRANSCRIPTION_MODEL)
-                        .part("file", part),
-                )
-                .send()
-                .await
-                .context("OpenAI transcription request failed")?;
-            let status = response.status();
-            if !status.is_success() {
-                bail!("OpenAI transcription returned HTTP {}", status.as_u16());
-            }
-            let result: Transcription = response
-                .json()
-                .await
-                .context("OpenAI transcription returned invalid JSON")?;
-            Ok(result.text)
-        })
+    if answer
+        .lines()
+        .any(|line| line.trim_start().starts_with('|'))
+    {
+        return ReplyModality::Text;
     }
-
-    fn synthesize<'a>(&'a self, text: &'a str) -> VoiceFuture<'a, AudioClip> {
-        Box::pin(async move {
-            let mut response = self
-                .client
-                .post(format!("{}/audio/speech", self.base_url))
-                .bearer_auth(&self.api_key)
-                .timeout(REQUEST_TIMEOUT)
-                .json(&json!({
-                    "model": SPEECH_MODEL,
-                    "voice": self.voice_name,
-                    "input": text,
-                    "instructions": "Speak naturally, clearly, and concisely.",
-                    "response_format": "opus"
-                }))
-                .send()
-                .await
-                .context("OpenAI speech request failed")?;
-            let status = response.status();
-            if !status.is_success() {
-                bail!("OpenAI speech returned HTTP {}", status.as_u16());
-            }
-            if response
-                .content_length()
-                .is_some_and(|size| size > MAX_AUDIO_BYTES as u64)
-            {
-                bail!("OpenAI speech response exceeds the 20 MB limit");
-            }
-            let mut bytes = Vec::with_capacity(
-                response
-                    .content_length()
-                    .unwrap_or_default()
-                    .min(MAX_AUDIO_BYTES as u64) as usize,
-            );
-            while let Some(chunk) = response
-                .chunk()
-                .await
-                .context("read OpenAI speech response")?
-            {
-                if bytes.len().saturating_add(chunk.len()) > MAX_AUDIO_BYTES {
-                    bail!("OpenAI speech response exceeds the 20 MB limit");
-                }
-                bytes.extend_from_slice(&chunk);
-            }
-            Ok(AudioClip {
-                bytes,
-                filename: "reply.opus".to_string(),
-                mime_type: "audio/ogg".to_string(),
-            })
-        })
+    if answer.contains("http://") || answer.contains("https://") {
+        return ReplyModality::Text;
     }
-}
-
-#[derive(Deserialize)]
-struct Transcription {
-    text: String,
+    if answer.contains("[send-file:") {
+        return ReplyModality::Text;
+    }
+    if gemini::speakable(answer).chars().count() >= VOICE_REPLY_MAX_CHARS {
+        return ReplyModality::Text;
+    }
+    ReplyModality::Voice
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::Value;
-    use std::io::{Read, Write};
-    use std::net::TcpListener;
-    use std::thread::JoinHandle;
 
     struct FakeProvider;
-
-    #[test]
-    fn environment_key_overrides_config_and_empty_values_are_ignored() {
-        assert_eq!(
-            resolve_openai_api_key(Some(" env-key "), Some("config-key")),
-            Some(("env-key", VoiceCredentialSource::Environment))
-        );
-        assert_eq!(
-            resolve_openai_api_key(Some("  "), Some(" config-key ")),
-            Some(("config-key", VoiceCredentialSource::Config))
-        );
-        assert_eq!(resolve_openai_api_key(Some(""), Some(" ")), None);
-        assert!(Voice::from_sources(None, Some("config-key"), "cedar").is_some());
-        assert!(Voice::from_sources(None, None, "cedar").is_none());
-    }
 
     impl VoiceProvider for FakeProvider {
         fn transcribe<'a>(&'a self, _clip: AudioClip) -> VoiceFuture<'a, String> {
@@ -280,8 +153,10 @@ mod tests {
             Box::pin(async {
                 Ok(AudioClip {
                     bytes: vec![1, 2, 3],
-                    filename: "reply.opus".to_string(),
+                    filename: "reply.ogg".to_string(),
                     mime_type: "audio/ogg".to_string(),
+                    duration_secs: Some(1.0),
+                    waveform: Some("AAAA".to_string()),
                 })
             })
         }
@@ -292,71 +167,21 @@ mod tests {
             bytes,
             filename: "voice.ogg".to_string(),
             mime_type: "audio/ogg".to_string(),
+            duration_secs: None,
+            waveform: None,
         }
     }
 
-    fn serve_once(
-        status: &str,
-        content_type: &str,
-        body: Vec<u8>,
-    ) -> (String, JoinHandle<Vec<u8>>) {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        let status = status.to_string();
-        let content_type = content_type.to_string();
-        let handle = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            stream
-                .set_read_timeout(Some(Duration::from_secs(5)))
-                .unwrap();
-            let mut request = Vec::new();
-            let mut buffer = [0_u8; 4096];
-            loop {
-                let count = stream.read(&mut buffer).unwrap();
-                if count == 0 {
-                    break;
-                }
-                request.extend_from_slice(&buffer[..count]);
-                let Some(headers_end) = request.windows(4).position(|window| window == b"\r\n\r\n")
-                else {
-                    continue;
-                };
-                let headers = String::from_utf8_lossy(&request[..headers_end]);
-                let content_length = headers
-                    .lines()
-                    .find_map(|line| {
-                        let (name, value) = line.split_once(':')?;
-                        name.eq_ignore_ascii_case("content-length")
-                            .then(|| value.trim().parse::<usize>().unwrap())
-                    })
-                    .unwrap_or_default();
-                if request.len() >= headers_end + 4 + content_length {
-                    break;
-                }
-            }
-            write!(
-                stream,
-                "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                body.len()
-            )
-            .unwrap();
-            stream.write_all(&body).unwrap();
-            request
-        });
-        (format!("http://{address}"), handle)
-    }
-
     #[tokio::test]
-    async fn provider_boundary_trims_transcripts_and_returns_opus() {
+    async fn provider_boundary_trims_transcripts_and_returns_ogg() {
         let voice = Voice::with_provider(Arc::new(FakeProvider));
         assert_eq!(
             voice.transcribe(clip(vec![1])).await.unwrap(),
             "remind me tomorrow"
         );
-        assert_eq!(
-            voice.synthesize("done").await.unwrap().mime_type,
-            "audio/ogg"
-        );
+        let out = voice.synthesize("done").await.unwrap();
+        assert_eq!(out.mime_type, "audio/ogg");
+        assert_eq!(out.duration_secs, Some(1.0));
     }
 
     #[tokio::test]
@@ -374,84 +199,37 @@ mod tests {
     }
 
     #[test]
-    fn defaults_use_current_openai_audio_models() {
-        assert_eq!(TRANSCRIPTION_MODEL, "gpt-4o-transcribe");
-        assert_eq!(SPEECH_MODEL, "gpt-4o-mini-tts");
-    }
-
-    #[tokio::test]
-    async fn openai_transcription_http_contract_uses_multipart_and_current_model() {
-        let (base_url, request) = serve_once(
-            "200 OK",
-            "application/json",
-            br#"{"text":"contract transcript"}"#.to_vec(),
-        );
-        let provider =
-            OpenAiVoice::with_base_url("test-key".to_string(), base_url, "cedar".to_string());
-
-        let transcript = provider
-            .transcribe(clip(b"audio-bytes".to_vec()))
-            .await
-            .unwrap();
-        let request = request.join().unwrap();
-        let request_text = String::from_utf8_lossy(&request);
-
-        assert_eq!(transcript, "contract transcript");
-        assert!(request_text.starts_with("POST /audio/transcriptions HTTP/1.1"));
-        assert!(request_text
-            .to_ascii_lowercase()
-            .contains("authorization: bearer test-key"));
-        assert!(request_text.contains("name=\"model\""));
-        assert!(request_text.contains(TRANSCRIPTION_MODEL));
-        assert!(request_text.contains("filename=\"voice.ogg\""));
-        assert!(request_text.contains("audio-bytes"));
-    }
-
-    #[tokio::test]
-    async fn openai_speech_http_contract_requests_opus_and_returns_audio() {
-        let (base_url, request) = serve_once("200 OK", "application/octet-stream", vec![9, 8, 7]);
-        let provider =
-            OpenAiVoice::with_base_url("test-key".to_string(), base_url, "onyx".to_string());
-
-        let output = provider.synthesize("hello").await.unwrap();
-        let request = request.join().unwrap();
-        let body_start = request
-            .windows(4)
-            .position(|window| window == b"\r\n\r\n")
-            .unwrap()
-            + 4;
-        let payload: Value = serde_json::from_slice(&request[body_start..]).unwrap();
-
-        assert_eq!(output.bytes, vec![9, 8, 7]);
-        assert_eq!(payload["model"], SPEECH_MODEL);
-        assert_eq!(payload["voice"], "onyx");
+    fn modality_rule_is_deterministic() {
+        // Typed input never gets voice.
+        assert_eq!(select_modality(false, "short"), ReplyModality::Text);
+        // A short voice answer gets voice.
+        assert_eq!(select_modality(true, "yes, done"), ReplyModality::Voice);
+        // At/over the speakable budget it becomes text, measured on the
+        // speakable text not the raw length.
         assert_eq!(
-            payload["instructions"],
-            "Speak naturally, clearly, and concisely."
+            select_modality(true, &"a".repeat(VOICE_REPLY_MAX_CHARS)),
+            ReplyModality::Text
         );
-        assert_eq!(payload["response_format"], "opus");
-        assert_eq!(payload["input"], "hello");
-    }
-
-    #[tokio::test]
-    async fn openai_http_errors_are_actionable_without_returning_body_content() {
-        let (base_url, request) = serve_once(
-            "401 Unauthorized",
-            "application/json",
-            br#"{"error":"secret upstream detail"}"#.to_vec(),
+        assert_eq!(
+            select_modality(true, &"a".repeat(VOICE_REPLY_MAX_CHARS - 1)),
+            ReplyModality::Voice
         );
-        let provider =
-            OpenAiVoice::with_base_url("bad-key".to_string(), base_url, "cedar".to_string());
-
-        let error = provider
-            .transcribe(clip(b"audio".to_vec()))
-            .await
-            .unwrap_err()
-            .to_string();
-        request.join().unwrap();
-
-        assert!(error.contains("HTTP 401"));
-        assert!(!error.contains("secret upstream detail"));
-        assert!(!error.contains("bad-key"));
+        // Hard overrides to text.
+        assert_eq!(
+            select_modality(true, "```rust\nlet x = 1;\n```"),
+            ReplyModality::Text
+        );
+        assert_eq!(
+            select_modality(true, "| a | b |\n| - | - |"),
+            ReplyModality::Text
+        );
+        assert_eq!(
+            select_modality(true, "see https://example.com"),
+            ReplyModality::Text
+        );
+        assert_eq!(
+            select_modality(true, "here\n[send-file: report.pdf]"),
+            ReplyModality::Text
+        );
     }
 }

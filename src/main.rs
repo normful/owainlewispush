@@ -1143,8 +1143,8 @@ bot_token = "xoxb-config"
 allow_user_ids = ["U1"]
 
 [voice]
-openai_api_key = "config-openai-key"
-name = "onyx"
+gemini_base_url = "https://gemini.example"
+name = "Puck"
 "#,
         );
 
@@ -1158,10 +1158,10 @@ name = "onyx"
         assert_eq!(cfg.slack_bot_token.as_deref(), Some("xoxb-config"));
         assert_eq!(cfg.slack_allow_user_ids, ["U1"]);
         assert_eq!(
-            cfg.voice_openai_api_key.as_deref(),
-            Some("config-openai-key")
+            cfg.voice_gemini_base_url.as_deref(),
+            Some("https://gemini.example")
         );
-        assert_eq!(cfg.voice_name, "onyx");
+        assert_eq!(cfg.voice_name, "Puck");
         let _ = std::fs::remove_file(path);
         let _ = std::fs::remove_dir_all(assistant);
     }
@@ -1188,13 +1188,13 @@ allow_user_ids = []
     }
 
     #[test]
-    fn voice_config_defaults_to_cedar_and_rejects_unknown_names() {
+    fn voice_config_defaults_to_kore_and_rejects_unknown_names() {
         let default_path = temp_path("default-voice-config");
         let default_assistant =
             write_config_with_assistant(&default_path, "self_handles = ['me@icloud.com']\n");
 
         let cfg = Config::load(default_path.to_str().unwrap()).unwrap();
-        assert_eq!(cfg.voice_name, "cedar");
+        assert_eq!(cfg.voice_name, "Kore");
 
         let invalid_path = temp_path("invalid-voice-config");
         let invalid_assistant = write_config_with_assistant(
@@ -1211,14 +1211,14 @@ allow_user_ids = []
     }
 
     #[test]
-    fn voice_config_rejects_an_empty_openai_key() {
-        let path = temp_path("empty-voice-key-config");
+    fn voice_config_rejects_an_empty_gemini_base_url() {
+        let path = temp_path("empty-voice-base-url-config");
         let assistant = write_config_with_assistant(
             &path,
             r#"self_handles = ["me@icloud.com"]
 
 [voice]
-openai_api_key = " "
+gemini_base_url = " "
 "#,
         );
 
@@ -1226,26 +1226,9 @@ openai_api_key = " "
 
         assert!(error
             .to_string()
-            .contains("voice.openai_api_key cannot be empty"));
+            .contains("voice.gemini_base_url cannot be empty"));
         let _ = std::fs::remove_file(path);
         let _ = std::fs::remove_dir_all(assistant);
-    }
-
-    #[test]
-    fn config_load_rejects_an_inline_voice_key_inside_the_assistant() {
-        let root = temp_dir("assistant-inline-voice-key");
-        let path = root.join("config.toml");
-        std::fs::write(
-            &path,
-            "self_handles = ['me@icloud.com']\nassistant_root = '.'\n[voice]\nopenai_api_key = 'committed-secret'\n",
-        )
-        .unwrap();
-
-        let error = Config::load(path.to_str().unwrap()).unwrap_err();
-
-        assert!(error.to_string().contains("inline OpenAI API key"));
-        assert!(error.to_string().contains("OPENAI_API_KEY"));
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

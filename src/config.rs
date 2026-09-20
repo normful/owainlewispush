@@ -13,12 +13,41 @@ use crate::util::expand_home;
 pub const TELEGRAM_BOT_TOKEN_ENV: &str = "TELEGRAM_BOT_TOKEN";
 pub const SLACK_APP_TOKEN_ENV: &str = "SLACK_APP_TOKEN";
 pub const SLACK_BOT_TOKEN_ENV: &str = "SLACK_BOT_TOKEN";
-pub const DEFAULT_VOICE_NAME: &str = "cedar";
+pub const DEFAULT_VOICE_NAME: &str = "Kore";
 /// Pi's valid `--thinking` levels (kept in sync with the pi CLI).
 const VALID_THINKING_LEVELS: &[&str] = &["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+/// Gemini prebuilt voice names (`prebuiltVoiceConfig.voiceName`).
 const SUPPORTED_VOICE_NAMES: &[&str] = &[
-    "alloy", "ash", "ballad", "coral", "echo", "fable", "nova", "onyx", "sage", "shimmer", "verse",
-    "marin", "cedar",
+    "Zephyr",
+    "Puck",
+    "Charon",
+    "Kore",
+    "Fenrir",
+    "Leda",
+    "Orus",
+    "Aoede",
+    "Callirrhoe",
+    "Autonoe",
+    "Enceladus",
+    "Iapetus",
+    "Umbriel",
+    "Algieba",
+    "Despina",
+    "Erinome",
+    "Algenib",
+    "Rasalgethi",
+    "Laomedeia",
+    "Achernar",
+    "Alnilam",
+    "Schedar",
+    "Gacrux",
+    "Pulcherrima",
+    "Achird",
+    "Zubenelgenubi",
+    "Vindemiatrix",
+    "Sadachbia",
+    "Sadaltager",
+    "Sulafat",
 ];
 
 #[cfg(test)]
@@ -92,7 +121,7 @@ pub struct Config {
     #[serde(default)]
     pub discord_allow_channel_ids: Vec<String>,
     #[serde(default)]
-    pub voice_openai_api_key: Option<String>,
+    pub voice_gemini_base_url: Option<String>,
     #[serde(default = "default_voice_name")]
     pub voice_name: String,
     #[serde(default = "default_agent")]
@@ -270,7 +299,7 @@ impl Config {
             root,
             "voice",
             &[
-                ("openai_api_key", "voice_openai_api_key"),
+                ("gemini_base_url", "voice_gemini_base_url"),
                 ("name", "voice_name"),
             ],
         )?;
@@ -311,11 +340,6 @@ impl Config {
                 &assistant_root,
                 c.slack_app_token.as_deref(),
                 c.slack_bot_token.as_deref(),
-            )?;
-            validate_inline_voice_key_location(
-                &config_path,
-                &assistant_root,
-                c.voice_openai_api_key.as_deref(),
             )?;
         }
         c.assistant_root = assistant_root.to_string_lossy().to_string();
@@ -652,11 +676,11 @@ impl Config {
 
     fn validate(&self) -> Result<()> {
         if self
-            .voice_openai_api_key
+            .voice_gemini_base_url
             .as_deref()
             .is_some_and(|value| value.trim().is_empty())
         {
-            bail!("voice.openai_api_key cannot be empty");
+            bail!("voice.gemini_base_url cannot be empty");
         }
         if !SUPPORTED_VOICE_NAMES.contains(&self.voice_name.as_str()) {
             bail!(
@@ -857,20 +881,6 @@ pub(crate) fn validate_inline_token_location(
     {
         bail!(
             "config {} contains an inline Telegram token inside the Git-versioned assistant repository. Move the config outside the assistant or use TELEGRAM_BOT_TOKEN.",
-            config_path.display()
-        );
-    }
-    Ok(())
-}
-
-pub(crate) fn validate_inline_voice_key_location(
-    config_path: &Path,
-    assistant_root: &Path,
-    key: Option<&str>,
-) -> Result<()> {
-    if key.is_some_and(|key| !key.trim().is_empty()) && config_path.starts_with(assistant_root) {
-        bail!(
-            "config {} contains an inline OpenAI API key inside the Git-versioned assistant repository. Move the config outside the assistant or use OPENAI_API_KEY.",
             config_path.display()
         );
     }
@@ -1261,7 +1271,7 @@ mod tests {
             discord_base_url: None,
             discord_channel_id: None,
             discord_allow_channel_ids: Vec::new(),
-            voice_openai_api_key: None,
+            voice_gemini_base_url: None,
             voice_name: DEFAULT_VOICE_NAME.to_string(),
             agent: "codex".to_string(),
             routes: Vec::new(),

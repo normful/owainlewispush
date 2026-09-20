@@ -1585,12 +1585,41 @@ impl DiscordChannel {
         Ok(())
     }
 
+    /// Sends a native Discord voice message (PLAN §6). `flags: 8192`,
+    /// `duration_secs`, and the 256-sample `waveform` are computed before the
+    /// PCM is transcoded, so they are carried on the clip.
+    pub async fn send_voice(&self, _target: &str, clip: &AudioClip) -> Result<()> {
+        let duration_secs = clip
+            .duration_secs
+            .context("voice reply is missing its duration")?;
+        let waveform = clip
+            .waveform
+            .clone()
+            .context("voice reply is missing its waveform")?;
+        self.upload_attachment(
+            AttachmentUpload {
+                filename: &clip.filename,
+                bytes: &clip.bytes,
+                content_type: "audio/ogg",
+                voice: Some(VoiceMetadata {
+                    duration_secs,
+                    waveform,
+                }),
+            },
+            "",
+        )
+        .await?;
+        Ok(())
+    }
+
     pub async fn download_voice(&self, voice: &InboundVoice) -> Result<AudioClip> {
         if let Some(bytes) = &voice.data {
             return Ok(AudioClip {
                 bytes: bytes.clone(),
                 filename: voice.filename.clone(),
                 mime_type: voice.mime_type.clone(),
+                duration_secs: None,
+                waveform: None,
             });
         }
         if voice.file_size.is_some_and(|size| size > MAX_AUDIO_BYTES) {
@@ -1605,6 +1634,8 @@ impl DiscordChannel {
             bytes,
             filename: voice.filename.clone(),
             mime_type: voice.mime_type.clone(),
+            duration_secs: None,
+            waveform: None,
         })
     }
 
@@ -2484,6 +2515,76 @@ mod tests {
                 ),
             ]
         );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn send_voice_carries_duration_and_waveform_into_the_upload() {
+        let dir = crate::test_support::temp_dir("send-voice");
+        let fake = Arc::new(FakeTransport::with_raw(vec![
+            json_response(
+                200,
+                json!({"attachments": [{
+                    "id": 0,
+                    "upload_filename": "u/reply.ogg",
+                    "upload_url": "https://discord-attachments-uploads-prd.storage.googleapis.com/u/reply.ogg?upload_id=t"
+                }]}),
+            ),
+            TransportResponse {
+                status: 200,
+                retry_after: None,
+                body: Vec::new(),
+            },
+            json_response(200, json!({"id": "5"})),
+        ]));
+        let channel = attachment_channel(fake.clone(), &dir.to_string_lossy());
+
+        channel
+            .send_voice(
+                "900",
+                &AudioClip {
+                    bytes: b"OggS".to_vec(),
+                    filename: "reply.ogg".to_string(),
+                    mime_type: "audio/ogg".to_string(),
+                    duration_secs: Some(2.5),
+                    waveform: Some("AAAA".to_string()),
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            fake.calls()[2],
+            Call::PostJson(
+                format!("{DEFAULT_BASE_URL}{API_PREFIX}/channels/900/messages"),
+                json!({
+                    "attachments": [{
+                        "id": 0,
+                        "filename": "reply.ogg",
+                        "uploaded_filename": "u/reply.ogg"
+                    }],
+                    "flags": 8192,
+                    "duration_secs": 2.5,
+                    "waveform": "AAAA"
+                })
+            )
+        );
+
+        // A clip without metadata is refused rather than sent malformed.
+        let missing = channel
+            .send_voice(
+                "900",
+                &AudioClip {
+                    bytes: b"OggS".to_vec(),
+                    filename: "reply.ogg".to_string(),
+                    mime_type: "audio/ogg".to_string(),
+                    duration_secs: None,
+                    waveform: None,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(missing.to_string().contains("duration"));
         let _ = std::fs::remove_dir_all(dir);
     }
 

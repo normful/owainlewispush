@@ -185,27 +185,24 @@ fn check_scheduled_delivery(cfg: &config::Config, checks: &mut Vec<Check>) {
 }
 
 fn check_voice(cfg: &config::Config, checks: &mut Vec<Check>) {
-    let message = voice_check_message(crate::voice::Voice::credential_source(cfg));
-    checks.push(Check::pass("voice messages", message));
-}
-
-fn voice_check_message(source: Option<crate::voice::VoiceCredentialSource>) -> &'static str {
-    match source {
-        Some(crate::voice::VoiceCredentialSource::Environment) => {
-            "OPENAI_API_KEY is set; transcription and speech replies are enabled"
-        }
-        Some(crate::voice::VoiceCredentialSource::Config) => {
-            "voice.openai_api_key is set; transcription and speech replies are enabled"
-        }
-        None => {
-            "no OpenAI API key is configured; text messaging works and voice requests get a helpful fallback"
-        }
-    }
+    let configured = cfg
+        .voice_gemini_base_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(crate::voice::GEMINI_VOICE_BASE_URL);
+    checks.push(Check::pass(
+        "voice messages",
+        format!(
+            "Gemini is configured (voice {}, model {}, base {configured}); transcription and speech replies use the exe.dev integration with no key on the VM",
+            cfg.voice_name,
+            crate::voice::TRANSCRIPTION_MODEL
+        ),
+    ));
 }
 
 fn check_secret_config_permissions(cfg: &config::Config, checks: &mut Vec<Check>) {
     if [
-        cfg.voice_openai_api_key.as_deref(),
         cfg.telegram_bot_token.as_deref(),
         cfg.slack_app_token.as_deref(),
         cfg.slack_bot_token.as_deref(),
@@ -538,23 +535,25 @@ mod tests {
     use crate::test_support::{temp_dir, temp_path, test_config};
 
     #[test]
-    fn voice_check_reports_config_source_without_a_secret() {
-        let message = voice_check_message(Some(crate::voice::VoiceCredentialSource::Config));
+    fn voice_check_reports_gemini_without_a_secret() {
+        let mut checks = Vec::new();
+        check_voice(&test_config(), &mut checks);
 
-        assert!(message.contains("voice.openai_api_key is set"));
-        assert!(!message.contains("secret"));
+        assert!(matches!(checks[0].status, CheckStatus::Pass));
+        assert!(checks[0].message.contains("Gemini"));
+        assert!(checks[0].message.contains("no key on the VM"));
     }
 
     #[cfg(unix)]
     #[test]
-    fn inline_voice_key_requires_a_private_config_file() {
+    fn inline_secret_requires_a_private_config_file() {
         use std::os::unix::fs::PermissionsExt;
 
         let path = temp_path("voice-config-permissions");
-        std::fs::write(&path, "[voice]\nopenai_api_key = 'secret'\n").unwrap();
+        std::fs::write(&path, "telegram_bot_token = 'secret'\n").unwrap();
         let mut cfg = test_config();
         cfg.config_path = path.to_string_lossy().to_string();
-        cfg.voice_openai_api_key = Some("secret".to_string());
+        cfg.telegram_bot_token = Some("secret".to_string());
 
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
         let mut checks = Vec::new();

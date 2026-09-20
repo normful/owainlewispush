@@ -693,8 +693,8 @@ async fn prepare_voice(ctx: &Ctx, job: &Job) -> std::result::Result<String, Voic
     let Some(voice) = &ctx.voice else {
         return Err(VoicePreparationError::User {
             event: "voice_not_configured",
-            reply: "Voice messages are unavailable. Set voice.openai_api_key in config or OPENAI_API_KEY, restart Push, or send text instead.",
-            detail: "OpenAI API key is not configured".to_string(),
+            reply: "Voice transcription is unavailable right now. Please try again or send text instead.",
+            detail: "the Gemini voice provider is not configured".to_string(),
         });
     };
     let clip = ctx
@@ -987,6 +987,18 @@ async fn deliver_stored(
         return Ok(DeliveryOutcome::AlreadyDelivered);
     }
     let mut outbound = outbound.clone();
+    // PLAN §3 modality rule: exactly one copy, chosen deterministically. A
+    // voice reply that fails to synthesize falls back to the text path below.
+    if crate::voice::select_modality(job.reply_with_voice, &outbound.content)
+        == crate::voice::ReplyModality::Voice
+        && deliver_voice_reply(ctx, job, &outbound.content).await?
+    {
+        ctx.history
+            .lock()
+            .unwrap()
+            .mark_delivery(outbound.id, DeliveryStatus::Delivered)?;
+        return Ok(DeliveryOutcome::Delivered);
+    }
     let semantics = ctx.channel.delivery_semantics();
     let mut attempt = 0;
     loop {
@@ -1002,7 +1014,6 @@ async fn deliver_stored(
             .unwrap()
             .mark_delivery(outbound.id, status)?;
         if delivered {
-            deliver_voice_reply(ctx, job, &outbound.content).await;
             return Ok(DeliveryOutcome::Delivered);
         }
         audit(
@@ -1071,21 +1082,21 @@ async fn deliver_outbound_once(
     Ok(true)
 }
 
-async fn deliver_voice_reply(ctx: &Ctx, job: &Job, text: &str) {
-    if !job.reply_with_voice {
-        return;
-    }
+/// Delivers a reply as a native voice message (PLAN §6). Returns `true` when
+/// the voice message was delivered; `false` means the caller must fall back to
+/// the text path.
+async fn deliver_voice_reply(ctx: &Ctx, job: &Job, text: &str) -> Result<bool> {
     let Some(voice) = &ctx.voice else {
-        return;
+        return Ok(false);
     };
     let clip = match voice.synthesize(text).await {
         Ok(clip) => clip,
         Err(error) => {
             warn!(
-                "[{}] voice reply synthesis failed; text reply was delivered: {error:#}",
+                "[{}] voice reply synthesis failed; falling back to text: {error:#}",
                 job.thread
             );
-            return;
+            return Ok(false);
         }
     };
     #[cfg(test)]
@@ -1094,13 +1105,18 @@ async fn deliver_voice_reply(ctx: &Ctx, job: &Job, text: &str) {
             .lock()
             .unwrap()
             .push((job.target.clone(), clip.bytes));
+        Ok(true)
     }
     #[cfg(not(test))]
-    if let Err(error) = ctx.channel.send_voice(&job.target, &clip).await {
-        warn!(
-            "[{}] voice reply delivery failed; text reply was delivered: {error:#}",
-            job.thread
-        );
+    match ctx.channel.send_voice(&job.target, &clip).await {
+        Ok(()) => Ok(true),
+        Err(error) => {
+            warn!(
+                "[{}] voice reply delivery failed; falling back to text: {error:#}",
+                job.thread
+            );
+            Ok(false)
+        }
     }
 }
 

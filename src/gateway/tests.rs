@@ -25,6 +25,8 @@ impl VoiceProvider for FakeVoice {
                 bytes: vec![4, 5, 6],
                 filename: "reply.opus".to_string(),
                 mime_type: "audio/ogg".to_string(),
+                duration_secs: None,
+                waveform: None,
             })
         })
     }
@@ -49,6 +51,8 @@ impl VoiceProvider for BlockingVoice {
                 bytes: vec![7],
                 filename: "reply.opus".to_string(),
                 mime_type: "audio/ogg".to_string(),
+                duration_secs: None,
+                waveform: None,
             })
         })
     }
@@ -1741,7 +1745,7 @@ async fn enabled_channels_process_concurrently_with_isolated_state_and_origin_re
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn telegram_voice_is_transcribed_and_gets_text_and_voice_replies() {
+async fn telegram_voice_is_transcribed_and_gets_a_voice_reply() {
     let state_path = temp_state_path();
     let sessions_dir = temp_path("voice-sessions");
     let assistant_dir = temp_path("voice-assistant");
@@ -1765,10 +1769,9 @@ async fn telegram_voice_is_transcribed_and_gets_text_and_voice_replies() {
         crate::prompt::current_message(&calls.lock().unwrap()[0].prompt).as_deref(),
         Some("voice request")
     );
-    assert_eq!(
-        gateway.ctx.sent_replies.lock().unwrap().as_slice(),
-        [("7".to_string(), "fake reply: voice request".to_string())]
-    );
+    // PLAN §3 modality rule: a short voice answer gets exactly one copy, and it
+    // is the voice message, not the text.
+    assert!(gateway.ctx.sent_replies.lock().unwrap().is_empty());
     assert_eq!(
         gateway.ctx.sent_voice_replies.lock().unwrap().as_slice(),
         [("7".to_string(), vec![4, 5, 6])]
@@ -2671,7 +2674,7 @@ async fn telegram_image_reaches_claude_and_is_removed_after_the_turn() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn telegram_voice_without_openai_key_falls_back_without_running_agent() {
+async fn telegram_voice_without_a_provider_falls_back_without_running_agent() {
     let state_path = temp_state_path();
     let sessions_dir = temp_path("voice-missing-key-sessions");
     let assistant_dir = temp_path("voice-missing-key-assistant");
@@ -2694,8 +2697,7 @@ async fn telegram_voice_without_openai_key_falls_back_without_running_agent() {
     assert!(calls.lock().unwrap().is_empty());
     let replies = gateway.ctx.sent_replies.lock().unwrap();
     let reply = &replies[0].1;
-    assert!(reply.contains("voice.openai_api_key"));
-    assert!(reply.contains("OPENAI_API_KEY"));
+    assert!(reply.contains("Voice transcription is unavailable"));
     assert_eq!(gateway.store.lock().unwrap().cursor("telegram").unwrap(), 1);
 
     let _ = std::fs::remove_file(&state_path);
@@ -3995,7 +3997,7 @@ fn test_config(state_path: &str, _sessions_dir: &str, assistant_dir: &str) -> Co
         discord_base_url: None,
         discord_channel_id: None,
         discord_allow_channel_ids: Vec::new(),
-        voice_openai_api_key: None,
+        voice_gemini_base_url: None,
         voice_name: crate::config::DEFAULT_VOICE_NAME.to_string(),
         agent: "codex".to_string(),
         routes: Vec::new(),

@@ -62,7 +62,7 @@ pub fn test_config() -> crate::config::Config {
         discord_base_url: None,
         discord_channel_id: None,
         discord_allow_channel_ids: Vec::new(),
-        voice_openai_api_key: None,
+        voice_gemini_base_url: None,
         voice_name: crate::config::DEFAULT_VOICE_NAME.to_string(),
         agent: "codex".to_string(),
         routes: Vec::new(),

@@ -1007,13 +1007,8 @@ impl ChannelContract for DiscordChannel {
         self.download_voice(voice).await
     }
 
-    async fn send_voice(&self, _target: &str, _clip: &AudioClip) -> Result<()> {
-        // TODO(discord-voice): a native Discord voice message needs
-        // `flags: 8192`, `duration_secs` and a base64 256-sample `waveform`, and
-        // `AudioClip` carries none of them. `DiscordChannel::upload_attachment`
-        // already implements the wire format for `Some(VoiceMetadata)`; Phase 6
-        // computes both values from the OGG/Opus bytes (PLAN §6, "Voice out").
-        bail!("Discord voice replies need OGG duration and waveform metadata (Phase 6)")
+    async fn send_voice(&self, target: &str, clip: &AudioClip) -> Result<()> {
+        self.send_voice(target, clip).await
     }
 
     async fn download_image(&self, image: &InboundImage) -> Result<DownloadedImage> {
@@ -1058,6 +1053,8 @@ fn inline_audio(voice: &InboundVoice, bytes: &[u8]) -> Result<AudioClip> {
         bytes: bytes.to_vec(),
         filename: voice.filename.clone(),
         mime_type: voice.mime_type.clone(),
+        duration_secs: None,
+        waveform: None,
     })
 }
 
