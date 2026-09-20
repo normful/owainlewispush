@@ -7,6 +7,7 @@ use anyhow::{bail, Context, Result};
 
 use crate::approval::AnswerOrigin;
 use crate::config::{ChannelKind, Config};
+use crate::discord::{self, DiscordChannel};
 use crate::image::DownloadedImage;
 use crate::imessage::{Poller as IMessagePoller, Sender as IMessageSender};
 use crate::slack::{parse_message_target, Slack};
@@ -97,6 +98,19 @@ pub struct ShutdownSemantics {
 #[allow(async_fn_in_trait)]
 trait ChannelContract {
     fn id(&self) -> &'static str;
+
+    /// Durable store key for this channel's cursor, completed-row ledger, and
+    /// deferred-row bookkeeping.
+    ///
+    /// Defaults to the provider id. Discord overrides it with
+    /// `discord:<guild-channel-id>`, because each guild channel is registered
+    /// as its own Push channel (PLAN §3) and therefore needs its own cursor
+    /// while still reporting the provider id `discord` for routing, audit, and
+    /// primary delivery.
+    fn store_key(&self) -> String {
+        self.id().to_string()
+    }
+
     fn primary_target(&self, configured: &str) -> Result<String>;
     async fn poll(&self, since: i64) -> Result<Vec<RawMessage>>;
     fn poll_is_complete_snapshot(&self) -> bool {
@@ -161,6 +175,7 @@ pub enum Channel {
     IMessage(IMessageChannel),
     Telegram(Telegram),
     Slack(Slack),
+    Discord(DiscordChannel),
 }
 
 impl Channel {
@@ -195,6 +210,20 @@ impl Channel {
                 cfg.slack_allow_user_ids.clone(),
                 &cfg.paths.inbox,
             )?)),
+            ChannelKind::Discord => Ok(Self::Discord(DiscordChannel::new(
+                &cfg.discord_base_url()?,
+                cfg.discord_channel_id()?,
+                cfg.discord_allow_channel_ids.clone(),
+            )?)),
+        }
+    }
+
+    pub fn store_key(&self) -> String {
+        match self {
+            Self::IMessage(channel) => ChannelContract::store_key(channel),
+            Self::Telegram(channel) => ChannelContract::store_key(channel),
+            Self::Slack(channel) => ChannelContract::store_key(channel),
+            Self::Discord(channel) => ChannelContract::store_key(channel),
         }
     }
 
@@ -203,6 +232,7 @@ impl Channel {
             Self::IMessage(channel) => ChannelContract::primary_target(channel, configured),
             Self::Telegram(channel) => ChannelContract::primary_target(channel, configured),
             Self::Slack(channel) => ChannelContract::primary_target(channel, configured),
+            Self::Discord(channel) => ChannelContract::primary_target(channel, configured),
         }
     }
 
@@ -211,6 +241,7 @@ impl Channel {
             Self::IMessage(channel) => ChannelContract::id(channel),
             Self::Telegram(channel) => ChannelContract::id(channel),
             Self::Slack(channel) => ChannelContract::id(channel),
+            Self::Discord(channel) => ChannelContract::id(channel),
         }
     }
 
@@ -219,6 +250,7 @@ impl Channel {
             Self::IMessage(channel) => ChannelContract::poll(channel, since).await,
             Self::Telegram(channel) => ChannelContract::poll(channel, since).await,
             Self::Slack(channel) => ChannelContract::poll(channel, since).await,
+            Self::Discord(channel) => ChannelContract::poll(channel, since).await,
         }
     }
 
@@ -227,6 +259,7 @@ impl Channel {
             Self::IMessage(channel) => ChannelContract::latest_cursor(channel).await,
             Self::Telegram(channel) => ChannelContract::latest_cursor(channel).await,
             Self::Slack(channel) => ChannelContract::latest_cursor(channel).await,
+            Self::Discord(channel) => ChannelContract::latest_cursor(channel).await,
         }
     }
 
@@ -235,6 +268,7 @@ impl Channel {
             Self::IMessage(channel) => ChannelContract::poll_is_complete_snapshot(channel),
             Self::Telegram(channel) => ChannelContract::poll_is_complete_snapshot(channel),
             Self::Slack(channel) => ChannelContract::poll_is_complete_snapshot(channel),
+            Self::Discord(channel) => ChannelContract::poll_is_complete_snapshot(channel),
         }
     }
 
@@ -244,6 +278,7 @@ impl Channel {
             Self::IMessage(channel) => ChannelContract::accept(channel, message),
             Self::Telegram(channel) => ChannelContract::accept(channel, message),
             Self::Slack(channel) => ChannelContract::accept(channel, message),
+            Self::Discord(channel) => ChannelContract::accept(channel, message),
         }
     }
 
@@ -252,6 +287,7 @@ impl Channel {
             Self::IMessage(channel) => ChannelContract::should_defer(channel, message, store),
             Self::Telegram(channel) => ChannelContract::should_defer(channel, message, store),
             Self::Slack(channel) => ChannelContract::should_defer(channel, message, store),
+            Self::Discord(channel) => ChannelContract::should_defer(channel, message, store),
         }
     }
 
@@ -260,6 +296,7 @@ impl Channel {
             Self::IMessage(channel) => ChannelContract::reject_reason(channel, message),
             Self::Telegram(channel) => ChannelContract::reject_reason(channel, message),
             Self::Slack(channel) => ChannelContract::reject_reason(channel, message),
+            Self::Discord(channel) => ChannelContract::reject_reason(channel, message),
         }
     }
 
@@ -268,6 +305,7 @@ impl Channel {
             Self::IMessage(channel) => ChannelContract::approval_origin(channel, message, thread),
             Self::Telegram(channel) => ChannelContract::approval_origin(channel, message, thread),
             Self::Slack(channel) => ChannelContract::approval_origin(channel, message, thread),
+            Self::Discord(channel) => ChannelContract::approval_origin(channel, message, thread),
         }
     }
 
@@ -276,6 +314,7 @@ impl Channel {
             Self::IMessage(channel) => ChannelContract::route_thread_groups(channel, thread),
             Self::Telegram(channel) => ChannelContract::route_thread_groups(channel, thread),
             Self::Slack(channel) => ChannelContract::route_thread_groups(channel, thread),
+            Self::Discord(channel) => ChannelContract::route_thread_groups(channel, thread),
         }
     }
 
@@ -284,6 +323,7 @@ impl Channel {
             Self::IMessage(channel) => ChannelContract::outbound_chunks(channel, text, marker),
             Self::Telegram(channel) => ChannelContract::outbound_chunks(channel, text, marker),
             Self::Slack(channel) => ChannelContract::outbound_chunks(channel, text, marker),
+            Self::Discord(channel) => ChannelContract::outbound_chunks(channel, text, marker),
         }
     }
 
@@ -298,6 +338,9 @@ impl Channel {
             Self::Slack(channel) => {
                 ChannelContract::scheduled_outbound_chunks(channel, text, marker)
             }
+            Self::Discord(channel) => {
+                ChannelContract::scheduled_outbound_chunks(channel, text, marker)
+            }
         }
     }
 
@@ -307,6 +350,7 @@ impl Channel {
             Self::IMessage(channel) => ChannelContract::send_chunk(channel, target, chunk).await,
             Self::Telegram(channel) => ChannelContract::send_chunk(channel, target, chunk).await,
             Self::Slack(channel) => ChannelContract::send_chunk(channel, target, chunk).await,
+            Self::Discord(channel) => ChannelContract::send_chunk(channel, target, chunk).await,
         }
     }
 
@@ -315,6 +359,7 @@ impl Channel {
             Self::IMessage(channel) => ChannelContract::typing_refresh(channel),
             Self::Telegram(channel) => ChannelContract::typing_refresh(channel),
             Self::Slack(channel) => ChannelContract::typing_refresh(channel),
+            Self::Discord(channel) => ChannelContract::typing_refresh(channel),
         }
     }
 
@@ -323,6 +368,7 @@ impl Channel {
             Self::IMessage(channel) => ChannelContract::send_typing(channel, target).await,
             Self::Telegram(channel) => ChannelContract::send_typing(channel, target).await,
             Self::Slack(channel) => ChannelContract::send_typing(channel, target).await,
+            Self::Discord(channel) => ChannelContract::send_typing(channel, target).await,
         }
     }
 
@@ -331,6 +377,7 @@ impl Channel {
             Self::IMessage(channel) => ChannelContract::download_voice(channel, voice).await,
             Self::Telegram(channel) => ChannelContract::download_voice(channel, voice).await,
             Self::Slack(channel) => ChannelContract::download_voice(channel, voice).await,
+            Self::Discord(channel) => ChannelContract::download_voice(channel, voice).await,
         }
     }
 
@@ -340,6 +387,7 @@ impl Channel {
             Self::IMessage(channel) => ChannelContract::send_voice(channel, target, clip).await,
             Self::Telegram(channel) => ChannelContract::send_voice(channel, target, clip).await,
             Self::Slack(channel) => ChannelContract::send_voice(channel, target, clip).await,
+            Self::Discord(channel) => ChannelContract::send_voice(channel, target, clip).await,
         }
     }
 
@@ -348,6 +396,7 @@ impl Channel {
             Self::IMessage(channel) => ChannelContract::download_image(channel, image).await,
             Self::Telegram(channel) => ChannelContract::download_image(channel, image).await,
             Self::Slack(channel) => ChannelContract::download_image(channel, image).await,
+            Self::Discord(channel) => ChannelContract::download_image(channel, image).await,
         }
     }
 
@@ -356,6 +405,7 @@ impl Channel {
             Self::IMessage(channel) => ChannelContract::delivery_semantics(channel),
             Self::Telegram(channel) => ChannelContract::delivery_semantics(channel),
             Self::Slack(channel) => ChannelContract::delivery_semantics(channel),
+            Self::Discord(channel) => ChannelContract::delivery_semantics(channel),
         }
     }
 
@@ -364,6 +414,7 @@ impl Channel {
             Self::IMessage(channel) => ChannelContract::shutdown_semantics(channel),
             Self::Telegram(channel) => ChannelContract::shutdown_semantics(channel),
             Self::Slack(channel) => ChannelContract::shutdown_semantics(channel),
+            Self::Discord(channel) => ChannelContract::shutdown_semantics(channel),
         }
     }
 }
@@ -779,6 +830,123 @@ impl ChannelContract for Slack {
     }
 }
 
+impl ChannelContract for DiscordChannel {
+    fn id(&self) -> &'static str {
+        "discord"
+    }
+
+    /// One cursor per guild channel, keyed as the plan specifies.
+    fn store_key(&self) -> String {
+        DiscordChannel::store_key(self).to_string()
+    }
+
+    fn primary_target(&self, configured: &str) -> Result<String> {
+        let configured = configured.trim();
+        if configured.is_empty() {
+            bail!("primary delivery target cannot be empty");
+        }
+        if configured != self.channel_id() {
+            bail!(
+                "Discord primary target {configured:?} is not the registered guild channel {}",
+                self.channel_id()
+            );
+        }
+        Ok(configured.to_string())
+    }
+
+    async fn poll(&self, since: i64) -> Result<Vec<RawMessage>> {
+        self.poll(since).await
+    }
+
+    async fn latest_cursor(&self) -> Result<i64> {
+        self.latest_cursor().await
+    }
+
+    fn accept(&self, message: &RawMessage) -> Option<(String, String)> {
+        // `accept` runs before transcription, routing, and any backend work, so
+        // the trigger rule lives here: a mention, a `!` prefix, or a voice note
+        // (which can carry neither — PLAN §3 Trigger).
+        if common_reject_reason(message).is_some()
+            || message.is_from_me
+            || !self.is_allowed(message)
+            || !discord::is_triggered(message, self.bot_user_id().as_deref())
+        {
+            return None;
+        }
+        let channel_id = self.channel_id().to_string();
+        Some((self.store_key().to_string(), channel_id))
+    }
+
+    fn reject_reason(&self, message: &RawMessage) -> &'static str {
+        if message.is_from_me {
+            "bot_message"
+        } else if !self.is_allowed(message) {
+            "not_allowlisted"
+        } else {
+            common_reject_reason(message).unwrap_or("not_triggered")
+        }
+    }
+
+    fn approval_origin(&self, message: &RawMessage, thread: &str) -> AnswerOrigin {
+        AnswerOrigin {
+            channel: self.id().to_string(),
+            thread_key: thread.to_string(),
+            sender_key: message.handle.clone(),
+            chat_key: message.chat_identifier.clone(),
+        }
+    }
+
+    fn route_thread_groups(&self, thread: &str) -> Vec<Vec<String>> {
+        vec![vec![thread.to_string()]]
+    }
+
+    fn outbound_chunks(&self, text: &str, _marker: &str) -> Vec<OutboundChunk> {
+        // Discord renders its own markdown flavour, so the agent's text is sent
+        // unchanged: no marker (the bot and the human are separate authors), no
+        // HTML or mrkdwn conversion.
+        discord::discord_chunks(text)
+            .into_iter()
+            .map(|text| OutboundChunk {
+                text,
+                rich_markdown: true,
+            })
+            .collect()
+    }
+
+    async fn send_chunk(&self, target: &str, chunk: &OutboundChunk) -> Result<()> {
+        self.send_text(target, &chunk.text).await
+    }
+
+    async fn download_voice(&self, voice: &InboundVoice) -> Result<AudioClip> {
+        self.download_voice(voice).await
+    }
+
+    async fn send_voice(&self, _target: &str, _clip: &AudioClip) -> Result<()> {
+        // TODO(discord-voice): a native Discord voice message needs
+        // `flags: 8192`, `duration_secs` and a base64 256-sample `waveform`, and
+        // `AudioClip` carries none of them. `DiscordChannel::upload_attachment`
+        // already implements the wire format for `Some(VoiceMetadata)`; Phase 6
+        // computes both values from the OGG/Opus bytes (PLAN §6, "Voice out").
+        bail!("Discord voice replies need OGG duration and waveform metadata (Phase 6)")
+    }
+
+    async fn download_image(&self, image: &InboundImage) -> Result<DownloadedImage> {
+        self.download_image(image).await
+    }
+
+    fn delivery_semantics(&self) -> DeliverySemantics {
+        DeliverySemantics {
+            // A 429 is handled inside the request helper as a `retry-after`
+            // back-off for that route, so these are generic HTTP failure
+            // retries. push retries a failed stored outbound indefinitely.
+            send_timeout: Duration::from_secs(30),
+            retry_attempts: 3,
+            retry_delay: Duration::from_secs(1),
+            exhausted_retry_delay: Duration::from_secs(10),
+        }
+    }
+}
+
 fn common_reject_reason(message: &RawMessage) -> Option<&'static str> {
     if !message.is_supported {
         Some("unsupported_update")
@@ -870,6 +1038,14 @@ mod tests {
         )
     }
 
+    fn discord() -> Channel {
+        Channel::Discord(DiscordChannel::for_contract_tests(
+            "900",
+            &["900"],
+            Some("42"),
+        ))
+    }
+
     fn imessage_message(chat: &str, handle: &str, is_from_me: bool) -> RawMessage {
         RawMessage {
             row_id: 1,
@@ -909,6 +1085,7 @@ mod tests {
         assert_contract::<IMessageChannel>();
         assert_contract::<Telegram>();
         assert_contract::<Slack>();
+        assert_contract::<DiscordChannel>();
     }
 
     #[test]
@@ -1132,6 +1309,81 @@ mod tests {
         assert!(!chunks[0]
             .text
             .contains(crate::markdown::SLACK_FORMAT_MARKER));
+    }
+
+    #[test]
+    fn discord_contract_uses_a_per_channel_cursor_key_and_the_trigger_rule() {
+        let channel = discord();
+        assert_eq!(channel.id(), "discord");
+        assert_eq!(channel.store_key(), "discord:900");
+        assert_eq!(channel.primary_target("900").unwrap(), "900".to_string());
+        assert!(channel.primary_target("901").is_err());
+        assert_eq!(channel.typing_refresh(), None);
+        assert_eq!(
+            channel.delivery_semantics().send_timeout,
+            Duration::from_secs(30)
+        );
+
+        let mut message = RawMessage {
+            row_id: 30,
+            provider_event_id: Some("30".to_string()),
+            channel: "discord",
+            handle: "7".to_string(),
+            chat_identifier: "900".to_string(),
+            is_group: false,
+            text: "hey <@42> what is the time".to_string(),
+            voice: None,
+            images: Vec::new(),
+            is_from_me: false,
+            is_supported: true,
+            thread_id: None,
+        };
+
+        let accepted = channel.accept(&message).unwrap();
+        assert_eq!(channel.accept(&message), Some(accepted.clone()));
+        assert_eq!(accepted.0, "discord:900");
+        assert_eq!(accepted.1, "900");
+        assert_eq!(
+            channel.route_thread_groups(&accepted.0),
+            [vec!["discord:900".to_string()]]
+        );
+        assert_eq!(
+            channel.approval_origin(&message, &accepted.0),
+            AnswerOrigin {
+                channel: "discord".to_string(),
+                thread_key: "discord:900".to_string(),
+                sender_key: "7".to_string(),
+                chat_key: "900".to_string(),
+            }
+        );
+
+        // A `!` prefix triggers, a bare message does not.
+        message.text = "!ping".to_string();
+        assert_eq!(channel.accept(&message).unwrap().1, "900");
+        message.text = "just chatting".to_string();
+        assert_eq!(channel.accept(&message), None);
+        assert_eq!(channel.reject_reason(&message), "not_triggered");
+
+        // Triggered somewhere else is not this channel's message.
+        message.chat_identifier = "901".to_string();
+        message.text = "!ping".to_string();
+        assert_eq!(channel.accept(&message), None);
+        assert_eq!(channel.reject_reason(&message), "not_allowlisted");
+
+        // The bot's own reply is never a trigger.
+        message.chat_identifier = "900".to_string();
+        message.text = "!reply".to_string();
+        message.is_from_me = true;
+        assert_eq!(channel.accept(&message), None);
+        assert_eq!(channel.reject_reason(&message), "bot_message");
+
+        let chunks = discord().outbound_chunks(&"x".repeat(crate::discord::TEXT_LIMIT), "ignored");
+        assert_eq!(chunks.len(), 2);
+        assert!(chunks.iter().all(|chunk| chunk.rich_markdown));
+        assert!(chunks
+            .iter()
+            .all(|chunk| chunk.text.chars().count() <= crate::discord::TEXT_LIMIT));
+        assert!(discord().outbound_chunks("", "ignored").is_empty());
     }
 
     #[test]

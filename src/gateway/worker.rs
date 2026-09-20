@@ -806,12 +806,12 @@ async fn complete_setup_failure(ctx: &Ctx, job: &Job, reply: &str) {
         }
     }
     audit(ctx, ctx.audit.completed(job.row_id, "setup_failed"));
-    complete_row(&ctx.store, &ctx.ack, ctx.channel.id(), job.row_id);
+    complete_row(&ctx.store, &ctx.ack, &ctx.channel.store_key(), job.row_id);
 }
 
 fn complete_job(ctx: &Ctx, job: &Job, reason: &str) {
     audit(ctx, ctx.audit.completed(job.row_id, reason));
-    complete_row(&ctx.store, &ctx.ack, ctx.channel.id(), job.row_id);
+    complete_row(&ctx.store, &ctx.ack, &ctx.channel.store_key(), job.row_id);
 }
 
 /// Handles gateway-level slash commands before anything reaches the agent.

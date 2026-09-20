@@ -68,6 +68,19 @@ pub struct Config {
     pub slack_bot_token: Option<String>,
     #[serde(default)]
     pub slack_allow_user_ids: Vec<String>,
+    /// Integration hostname for the Discord Bot integration, for example
+    /// `https://discord.int.exe.xyz`. **Not a secret**: the integration injects
+    /// the bot token server-side, so no token exists on this VM (PLAN §2).
+    #[serde(default)]
+    pub discord_base_url: Option<String>,
+    /// The single guild channel this assistant answers in, also selectable in
+    /// `channel` / `channels` as `discord:<guild-channel-id>`.
+    #[serde(default)]
+    pub discord_channel_id: Option<String>,
+    /// Allowlisted guild channel ids, the Discord equivalent of
+    /// `telegram_allow_chat_ids`.
+    #[serde(default)]
+    pub discord_allow_channel_ids: Vec<String>,
     #[serde(default)]
     pub voice_openai_api_key: Option<String>,
     #[serde(default = "default_voice_name")]
@@ -236,6 +249,15 @@ impl Config {
         )?;
         flatten_provider_section(
             root,
+            "discord",
+            &[
+                ("base_url", "discord_base_url"),
+                ("channel_id", "discord_channel_id"),
+                ("allow_channel_ids", "discord_allow_channel_ids"),
+            ],
+        )?;
+        flatten_provider_section(
+            root,
             "voice",
             &[
                 ("openai_api_key", "voice_openai_api_key"),
@@ -243,6 +265,7 @@ impl Config {
             ],
         )?;
         let mut c: Config = value.try_into().context("parse TOML config")?;
+        apply_discord_channel_selector(&mut c)?;
         let config_path = std::fs::canonicalize(&expanded_path)
             .with_context(|| format!("resolve config {expanded_path}"))?;
         c.db_path = expand_home(&c.db_path);
@@ -381,6 +404,61 @@ impl Config {
 
     pub fn slack_bot_token(&self) -> Option<String> {
         configured_secret(self.slack_bot_token.as_deref(), SLACK_BOT_TOKEN_ENV)
+    }
+
+    /// The Discord integration hostname, normalized to an `https` URL.
+    ///
+    /// There is no Discord token setting anywhere in Push: the exe.dev
+    /// integration injects the bot token server-side, so this hostname is the
+    /// entire credential surface (PLAN §2).
+    pub fn discord_base_url(&self) -> Result<String> {
+        let configured = self
+            .discord_base_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .with_context(|| {
+                format!(
+                    "set discord.base_url to the integration hostname, for example {:?}",
+                    crate::discord::DEFAULT_BASE_URL
+                )
+            })?;
+        let normalized = if configured.contains("://") {
+            configured.to_string()
+        } else {
+            format!("https://{configured}")
+        };
+        let normalized = normalized.trim_end_matches('/').to_string();
+        let url = reqwest::Url::parse(&normalized)
+            .with_context(|| format!("invalid discord.base_url {configured:?}"))?;
+        if url.scheme() != "https" {
+            bail!(
+                "discord.base_url must use https; the integration injects the bot token, so it must not be reached in plaintext"
+            );
+        }
+        if url.host_str().is_none_or(str::is_empty) {
+            bail!("discord.base_url {configured:?} has no host");
+        }
+        if !matches!(url.path(), "" | "/") {
+            bail!("discord.base_url must be a bare hostname without a path");
+        }
+        Ok(normalized)
+    }
+
+    /// The single guild channel this assistant answers in.
+    pub fn discord_channel_id(&self) -> Result<String> {
+        let id = self
+            .discord_channel_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .context(
+                "set discord.channel_id, or select the guild channel with channel = \"discord:<guild-channel-id>\"",
+            )?;
+        if !is_discord_snowflake(id) {
+            bail!("discord.channel_id {id:?} must be a numeric Discord channel id");
+        }
+        Ok(id.to_string())
     }
 
     pub fn route_for_message(
@@ -559,6 +637,33 @@ impl Config {
                         .is_some_and(|v| v.trim().is_empty())
                     {
                         bail!("slack.bot_token cannot be empty");
+                    }
+                }
+                ChannelKind::Discord => {
+                    // Discord is allowlisted by guild channel, not by sender:
+                    // the integration exposes a bot identity, and the channel
+                    // is the operator boundary, exactly as it is for Telegram
+                    // chats.
+                    self.discord_base_url()?;
+                    let channel_id = self.discord_channel_id()?;
+                    if self.discord_allow_channel_ids.is_empty() {
+                        bail!(
+                            "set discord.allow_channel_ids to the guild channel id Discord answers in"
+                        );
+                    }
+                    for allowed in &self.discord_allow_channel_ids {
+                        if !is_discord_snowflake(allowed.trim()) {
+                            bail!(
+                                "discord.allow_channel_ids must contain numeric Discord channel ids, found {allowed:?}"
+                            );
+                        }
+                    }
+                    if !self
+                        .discord_allow_channel_ids
+                        .iter()
+                        .any(|allowed| allowed.trim() == channel_id)
+                    {
+                        bail!("discord channel {channel_id} is not in discord.allow_channel_ids");
                     }
                 }
             }
@@ -802,16 +907,32 @@ pub enum ChannelKind {
     IMessage,
     Telegram,
     Slack,
+    Discord,
 }
 
 impl ChannelKind {
+    /// Parses a channel selector. Discord additionally accepts
+    /// `discord:<guild-channel-id>`, because each guild channel is registered
+    /// as its own Push channel (PLAN §3). The id is recorded on the config by
+    /// [`apply_discord_channel_selector`]; the kind itself stays data-less until
+    /// multi-channel Discord arrives.
     pub fn parse(s: &str) -> Result<Self> {
         match s {
             "imessage" => Ok(Self::IMessage),
             "telegram" => Ok(Self::Telegram),
             "slack" => Ok(Self::Slack),
+            "discord" => Ok(Self::Discord),
+            other if other.starts_with("discord:") => {
+                let id = &other["discord:".len()..];
+                if !is_discord_snowflake(id) {
+                    bail!(
+                        "invalid discord channel selector {other:?}; expected \"discord\" or \"discord:<guild-channel-id>\""
+                    );
+                }
+                Ok(Self::Discord)
+            }
             other => bail!(
-                "invalid channel {other:?}; expected \"imessage\", \"telegram\", or \"slack\""
+                "invalid channel {other:?}; expected \"imessage\", \"telegram\", \"slack\", \"discord\", or \"discord:<guild-channel-id>\""
             ),
         }
     }
@@ -821,8 +942,46 @@ impl ChannelKind {
             Self::IMessage => "imessage",
             Self::Telegram => "telegram",
             Self::Slack => "slack",
+            Self::Discord => "discord",
         }
     }
+}
+
+/// A Discord snowflake: all digits and small enough to stay an exact `i64`,
+/// which is what push uses as a channel row id.
+fn is_discord_snowflake(value: &str) -> bool {
+    let value = value.trim();
+    !value.is_empty()
+        && value.len() <= 19
+        && value.chars().all(|character| character.is_ascii_digit())
+        && value.parse::<i64>().is_ok()
+}
+
+/// Records the guild channel id carried by a `discord:<id>` selector, so
+/// `channel = "discord:123"` is enough to configure the channel. An explicit
+/// `discord.channel_id` that disagrees is a configuration error rather than a
+/// silent winner.
+fn apply_discord_channel_selector(cfg: &mut Config) -> Result<()> {
+    let selectors =
+        std::iter::once(cfg.channel.as_str()).chain(cfg.channels.iter().map(String::as_str));
+    for selector in selectors {
+        let Some(id) = selector.strip_prefix("discord:") else {
+            continue;
+        };
+        let id = id.trim();
+        if !is_discord_snowflake(id) {
+            bail!("discord channel selector {selector:?} must carry a numeric guild channel id");
+        }
+        match cfg.discord_channel_id.as_deref().map(str::trim) {
+            Some(existing) if !existing.is_empty() && existing != id => {
+                bail!(
+                    "discord channel selector {selector:?} conflicts with discord.channel_id {existing:?}"
+                )
+            }
+            _ => cfg.discord_channel_id = Some(id.to_string()),
+        }
+    }
+    Ok(())
 }
 
 fn configured_secret(inline: Option<&str>, environment: &str) -> Option<String> {
@@ -917,6 +1076,9 @@ mod tests {
             slack_app_token: None,
             slack_bot_token: None,
             slack_allow_user_ids: Vec::new(),
+            discord_base_url: None,
+            discord_channel_id: None,
+            discord_allow_channel_ids: Vec::new(),
             voice_openai_api_key: None,
             voice_name: DEFAULT_VOICE_NAME.to_string(),
             agent: "codex".to_string(),
@@ -936,6 +1098,131 @@ mod tests {
             agent_commands: AgentCommands::default(),
             assistant_dir: root.to_string_lossy().to_string(),
         }
+    }
+
+    #[test]
+    fn discord_channel_selector_loads_from_toml() {
+        let root = temp_dir("config-discord-load");
+        let assistant = root.join("assistant");
+        std::fs::create_dir_all(&assistant).unwrap();
+        let path = root.join("config.toml");
+        std::fs::write(
+            &path,
+            format!(
+                "channel = \"discord:900\"\nagent = \"pi\"\nassistant_root = \"{}\"\n\n[discord]\nbase_url = \"discord.int.exe.xyz\"\nallow_channel_ids = [\"900\"]\n",
+                assistant.to_string_lossy()
+            ),
+        )
+        .unwrap();
+
+        let cfg = Config::load_with_paths(
+            path.to_str().unwrap(),
+            PushPaths::from_root(root.join("runtime")).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            cfg.enabled_channel_kinds().unwrap(),
+            vec![ChannelKind::Discord]
+        );
+        assert_eq!(cfg.channel_kind().unwrap(), ChannelKind::Discord);
+        assert_eq!(cfg.discord_channel_id().unwrap(), "900");
+        assert_eq!(
+            cfg.discord_base_url().unwrap(),
+            "https://discord.int.exe.xyz"
+        );
+
+        // Phase 3 registers exactly one guild channel. A second, different id
+        // is a configuration error rather than a silently ignored selector,
+        // because `ChannelKind` carries no guild channel id yet (Phase 4).
+        std::fs::write(
+            &path,
+            format!(
+                "channels = [\"discord:900\", \"discord:901\"]\nagent = \"pi\"\nassistant_root = \"{}\"\n\n[discord]\nbase_url = \"discord.int.exe.xyz\"\nallow_channel_ids = [\"900\", \"901\"]\n",
+                assistant.to_string_lossy()
+            ),
+        )
+        .unwrap();
+        let error = Config::load_with_paths(
+            path.to_str().unwrap(),
+            PushPaths::from_root(root.join("runtime")).unwrap(),
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("conflicts with discord.channel_id"),
+            "{error}"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn discord_selectors_carry_the_guild_channel_and_are_validated() {
+        assert_eq!(ChannelKind::parse("discord").unwrap(), ChannelKind::Discord);
+        assert_eq!(
+            ChannelKind::parse("discord:900").unwrap(),
+            ChannelKind::Discord
+        );
+        assert!(ChannelKind::parse("discord").unwrap().as_str() == "discord");
+        assert!(ChannelKind::parse("discord:").is_err());
+        assert!(ChannelKind::parse("discord:main").is_err());
+        assert!(ChannelKind::parse("discordd").is_err());
+
+        let mut cfg = config();
+        cfg.channel = "discord:900".to_string();
+        cfg.discord_base_url = Some("discord.int.exe.xyz".to_string());
+        cfg.discord_allow_channel_ids = vec!["900".to_string()];
+        apply_discord_channel_selector(&mut cfg).unwrap();
+
+        assert_eq!(cfg.discord_channel_id.as_deref(), Some("900"));
+        assert_eq!(cfg.channel_kind().unwrap(), ChannelKind::Discord);
+        assert_eq!(
+            cfg.discord_base_url().unwrap(),
+            "https://discord.int.exe.xyz"
+        );
+        cfg.validate().unwrap();
+
+        // A conflicting explicit channel id is rejected rather than guessed.
+        let mut conflict = cfg.clone();
+        conflict.discord_channel_id = Some("901".to_string());
+        assert!(apply_discord_channel_selector(&mut conflict).is_err());
+
+        // The channel id must be allowlisted...
+        let mut unlisted = config();
+        unlisted.channel = "discord:900".to_string();
+        unlisted.discord_base_url = Some("discord.int.exe.xyz".to_string());
+        unlisted.discord_allow_channel_ids = vec!["901".to_string()];
+        apply_discord_channel_selector(&mut unlisted).unwrap();
+        assert!(unlisted
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("not in discord.allow_channel_ids"));
+
+        // ...the integration hostname must be present and https...
+        let mut insecure = config();
+        insecure.channel = "discord".to_string();
+        insecure.discord_base_url = Some("http://discord.int.exe.xyz".to_string());
+        insecure.discord_channel_id = Some("900".to_string());
+        insecure.discord_allow_channel_ids = vec!["900".to_string()];
+        assert!(insecure
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("must use https"));
+
+        // ...and a channel id is required one way or the other.
+        let mut missing = config();
+        missing.channel = "discord".to_string();
+        missing.discord_base_url = Some("discord.int.exe.xyz".to_string());
+        missing.discord_allow_channel_ids = vec!["900".to_string()];
+        assert!(missing
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("discord.channel_id"));
     }
 
     #[test]

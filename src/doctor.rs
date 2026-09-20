@@ -79,6 +79,7 @@ fn run_checks(cfg: &config::Config) -> CheckReport {
                     config::ChannelKind::IMessage => check_imessage_db(cfg, &mut checks),
                     config::ChannelKind::Telegram => check_telegram_config(cfg, &mut checks),
                     config::ChannelKind::Slack => check_slack_config(cfg, &mut checks),
+                    config::ChannelKind::Discord => check_discord_config(cfg, &mut checks),
                 }
             }
         }
@@ -88,6 +89,29 @@ fn run_checks(cfg: &config::Config) -> CheckReport {
     check_bins(cfg, &mut checks);
     check_voice(cfg, &mut checks);
     CheckReport { checks }
+}
+
+/// Checked from configuration alone: there is no bot token on this VM, so
+/// there is nothing to probe with, and the integration is only reachable from
+/// the deployment the config describes.
+fn check_discord_config(cfg: &config::Config, checks: &mut Vec<Check>) {
+    let Some(channel_id) = cfg.discord_channel_id.as_deref() else {
+        checks.push(Check::fail(
+            "discord",
+            "no guild channel id configured; set discord.channel_id or channel = \"discord:<guild-channel-id>\"",
+        ));
+        return;
+    };
+    let base = cfg
+        .discord_base_url()
+        .unwrap_or_else(|error| format!("<invalid: {error}>"));
+    checks.push(Check::pass(
+        "discord",
+        format!(
+            "integration={base}, guild channel={channel_id}, allow_channel_ids={}",
+            cfg.discord_allow_channel_ids.len()
+        ),
+    ));
 }
 
 fn check_scheduled_delivery(cfg: &config::Config, checks: &mut Vec<Check>) {
@@ -218,7 +242,7 @@ fn check_config(cfg: &config::Config, checks: &mut Vec<Check>) {
     checks.push(Check::pass(
         "config",
         format!(
-            "channels={}, agent={}, assistant_root={}, imessage.self_handles={}, imessage.allow_from={}, telegram.allow_user_ids={}, telegram.allow_chat_ids={}, slack.allow_user_ids={}",
+            "channels={}, agent={}, assistant_root={}, imessage.self_handles={}, imessage.allow_from={}, telegram.allow_user_ids={}, telegram.allow_chat_ids={}, slack.allow_user_ids={}, discord.channel_id={:?}",
             cfg.enabled_channel_kinds()
                 .map(|channels| channels.into_iter().map(|kind| kind.as_str()).collect::<Vec<_>>().join(","))
                 .unwrap_or_else(|_| cfg.channel.clone()),
@@ -228,7 +252,8 @@ fn check_config(cfg: &config::Config, checks: &mut Vec<Check>) {
             cfg.allow_from.len(),
             cfg.telegram_allow_user_ids.len(),
             cfg.telegram_allow_chat_ids.len(),
-            cfg.slack_allow_user_ids.len()
+            cfg.slack_allow_user_ids.len(),
+            cfg.discord_channel_id
         ),
     ));
 }

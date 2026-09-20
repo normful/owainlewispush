@@ -529,12 +529,14 @@ impl Gateway {
     }
 
     async fn skip_backlog(&self) -> Result<()> {
-        let channel_id = self.channel.id();
+        // Durable state is keyed by the channel's store key, which a
+        // multi-instance channel may widen beyond its provider id.
+        let channel_id = self.channel.store_key();
         if self
             .store
             .lock()
             .unwrap()
-            .has_cursor(channel_id)
+            .has_cursor(&channel_id)
             .with_context(|| format!("check initial {channel_id} cursor"))?
         {
             return Ok(());
@@ -547,14 +549,15 @@ impl Gateway {
         self.store
             .lock()
             .unwrap()
-            .set_cursor(channel_id, max)
+            .set_cursor(&channel_id, max)
             .with_context(|| format!("persist initial {channel_id} cursor"))?;
         info!("starting {channel_id} from cursor {max} (skipping backlog)");
         Ok(())
     }
 
     async fn tick(&mut self) {
-        let since = match self.store.lock().unwrap().cursor(self.channel.id()) {
+        let store_key = self.channel.store_key();
+        let since = match self.store.lock().unwrap().cursor(&store_key) {
             Ok(cursor) => cursor,
             Err(error) => {
                 error!(
@@ -588,9 +591,10 @@ impl Gateway {
 
     async fn process_messages(&mut self, msgs: Vec<RawMessage>, complete_snapshot: bool) {
         self.recover_closed_workers();
-        retry_completion_persistence(&self.store, &self.ack, self.channel.id());
-        persist_cursor(&self.store, &self.ack, self.channel.id());
-        let mut since = match self.store.lock().unwrap().cursor(self.channel.id()) {
+        let store_key = self.channel.store_key();
+        retry_completion_persistence(&self.store, &self.ack, &store_key);
+        persist_cursor(&self.store, &self.ack, &store_key);
+        let mut since = match self.store.lock().unwrap().cursor(&store_key) {
             Ok(cursor) => cursor,
             Err(error) => {
                 error!(
@@ -627,8 +631,8 @@ impl Gateway {
                         );
                     }
                 }
-                persist_cursor(&self.store, &self.ack, self.channel.id());
-                since = match self.store.lock().unwrap().cursor(self.channel.id()) {
+                persist_cursor(&self.store, &self.ack, &store_key);
+                since = match self.store.lock().unwrap().cursor(&store_key) {
                     Ok(cursor) => cursor,
                     Err(error) => {
                         error!(
@@ -645,7 +649,7 @@ impl Gateway {
                 .store
                 .lock()
                 .unwrap()
-                .completed_rows_after(self.channel.id(), since)
+                .completed_rows_after(&store_key, since)
             {
                 Ok(rows) => rows.into_iter().collect::<BTreeSet<_>>(),
                 Err(error) => {
@@ -665,7 +669,7 @@ impl Gateway {
             }
             if durable_completed.contains(&m.row_id) {
                 self.ack.lock().unwrap().completed.insert(m.row_id);
-                persist_cursor(&self.store, &self.ack, self.channel.id());
+                persist_cursor(&self.store, &self.ack, &store_key);
                 continue;
             }
             if self.ack.lock().unwrap().is_known(m.row_id) {
@@ -1177,7 +1181,7 @@ impl Gateway {
 
     fn complete_row(&self, row_id: i64, reason: &str) {
         self.audit(self.ctx.audit.completed(row_id, reason));
-        complete_row(&self.store, &self.ack, self.channel.id(), row_id);
+        complete_row(&self.store, &self.ack, &self.channel.store_key(), row_id);
     }
 
     fn audit(&self, event: AuditEvent) {

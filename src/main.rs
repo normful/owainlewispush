@@ -11,6 +11,7 @@ mod claude;
 mod cli_json;
 mod codex;
 mod config;
+mod discord;
 mod doctor;
 mod gateway;
 mod history;
