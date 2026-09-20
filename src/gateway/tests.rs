@@ -3049,6 +3049,107 @@ async fn stop_interrupts_a_worker_queued_in_the_same_poll_batch() {
     let _ = std::fs::remove_dir_all(assistant_dir);
 }
 
+/// PLAN §7 barge-in (defect #4): with `barge_in = true`, a newer message on the
+/// thread interrupts the running turn — without `/stop` — and then runs.
+#[tokio::test(flavor = "current_thread")]
+async fn barge_in_interrupts_the_running_turn_for_a_newer_message() {
+    let state_path = temp_state_path();
+    let sessions_dir = temp_path("barge-in-sessions");
+    let assistant_dir = temp_path("barge-in-assistant");
+    std::fs::create_dir_all(&assistant_dir).unwrap();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let release = Arc::new(tokio::sync::Notify::new());
+    let mut cfg = test_config(
+        &state_path,
+        sessions_dir.to_str().unwrap(),
+        assistant_dir.to_str().unwrap(),
+    );
+    cfg.barge_in = true;
+    let mut gateway = Gateway::new(cfg).unwrap();
+    let mut runners = HashMap::new();
+    runners.insert(
+        AgentBackend::Codex,
+        Runner::Fake(FakeRunner {
+            backend: AgentBackend::Codex,
+            session_id: "fake-session".to_string(),
+            calls: calls.clone(),
+            before_return: None,
+            wait_for_release: Some(release.clone()),
+            failure: None,
+            resume_missing_once: None,
+        }),
+    );
+    gateway.ctx.runners = Arc::new(runners);
+
+    gateway
+        .tick_fake(vec![message(1, "me@icloud.com", "", true, "slow")])
+        .await;
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if !calls.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the first run should start");
+
+    gateway
+        .tick_fake(vec![message(2, "me@icloud.com", "", true, "newer")])
+        .await;
+    let interrupted = tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if gateway
+                .ctx
+                .sent_replies
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(_, reply)| reply.contains("Stopped the current request"))
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    interrupted.expect("barge-in should interrupt the running turn without /stop");
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if calls.lock().unwrap().len() >= 2 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the newer message should run after the interrupt");
+    release.notify_one();
+    gateway.queues.clear();
+    gateway.drain_workers().await;
+
+    let messages = calls
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|call| crate::prompt::current_message(&call.prompt))
+        .collect::<Vec<_>>();
+    assert!(messages
+        .iter()
+        .any(|message| message.as_deref() == Some("slow")));
+    assert!(messages
+        .iter()
+        .any(|message| message.as_deref() == Some("newer")));
+
+    let _ = std::fs::remove_file(&state_path);
+    let _ = std::fs::remove_file(format!("{state_path}.db"));
+    let _ = std::fs::remove_file(format!("{state_path}.audit.jsonl"));
+    let _ = std::fs::remove_dir_all(sessions_dir);
+    let _ = std::fs::remove_dir_all(assistant_dir);
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn stale_stop_signal_does_not_interrupt_a_later_row() {
     let state_path = temp_state_path();
@@ -4286,6 +4387,7 @@ fn test_config(state_path: &str, _sessions_dir: &str, assistant_dir: &str) -> Co
         approval_gated_tools: Vec::new(),
         approval_timeout: "10m".to_string(),
         approval_gate_extension: None,
+        barge_in: false,
         routes: Vec::new(),
         assistant_root: assistant_dir.to_string(),
         jobs_dir: format!("{state_path}.jobs"),

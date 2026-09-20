@@ -71,6 +71,7 @@ pub fn test_config() -> crate::config::Config {
         approval_gated_tools: Vec::new(),
         approval_timeout: "10m".to_string(),
         approval_gate_extension: None,
+        barge_in: false,
         routes: Vec::new(),
         assistant_root: "/fake/assistant".to_string(),
         jobs_dir: "/fake/jobs".to_string(),

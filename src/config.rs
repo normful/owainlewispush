@@ -150,6 +150,11 @@ pub struct Config {
     /// `approval_gated_tools` is non-empty.
     #[serde(default)]
     pub approval_gate_extension: Option<String>,
+    /// Interrupt the running turn when a newer message arrives on the same
+    /// thread (PLAN §7 barge-in, defect #4). Default off: a newer message
+    /// queues behind the running one, as before.
+    #[serde(default)]
+    pub barge_in: bool,
     #[serde(default)]
     pub routes: Vec<RouteRule>,
     /// Canonical root of the single user-owned assistant repository.
@@ -1378,6 +1383,7 @@ mod tests {
             approval_gated_tools: Vec::new(),
             approval_timeout: "10m".to_string(),
             approval_gate_extension: None,
+            barge_in: false,
             routes: Vec::new(),
             assistant_root: root.to_string_lossy().to_string(),
             jobs_dir: root.join("jobs").to_string_lossy().to_string(),

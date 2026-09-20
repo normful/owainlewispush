@@ -1086,6 +1086,21 @@ impl Gateway {
             return true;
         }
 
+        // Barge-in (PLAN §7, defect #4): a newer message interrupts the
+        // running turn on this thread. The interrupt targets the *running* row
+        // id (not the new one) and the new job still queues behind it, so the
+        // worker emits "Stopped the current request." and then runs this job.
+        if self.cfg.barge_in {
+            if let Some(worker) = self.queues.get(&thread) {
+                let current = worker.state.lock().unwrap().current_row;
+                if let Some(current) = current.filter(|current| *current != row_id) {
+                    if worker.cancel.send(current).is_ok() {
+                        info!("[{thread}] barge-in: interrupting row {current}");
+                    }
+                }
+            }
+        }
+
         self.queues
             .get(&thread)
             .unwrap()
