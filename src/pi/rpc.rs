@@ -133,6 +133,15 @@ impl UiHandler for CancelHandler {
     }
 }
 
+/// Extension-UI methods the host never answers because they are fire-and-forget
+/// notifications rather than blocking dialogs.
+fn is_fire_and_forget(method: &str) -> bool {
+    matches!(
+        method,
+        "notify" | "setStatus" | "setWidget" | "setTitle" | "set_editor_text"
+    )
+}
+
 /// One advisory chunk of streamed assistant text (DESIGN §5). The stream is
 /// lossy on crash; [`TurnOutcome::text`] is authoritative.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -396,6 +405,12 @@ impl Session {
                         .and_then(Value::as_str)
                         .unwrap_or_default()
                         .to_string();
+                    // notify/setStatus/setWidget/setTitle/set_editor_text are
+                    // fire-and-forget: answering one is protocol noise (the
+                    // spike confirms this), so skip it entirely.
+                    if is_fire_and_forget(&method) {
+                        continue;
+                    }
                     let title = value
                         .get("title")
                         .or_else(|| value.get("message"))
@@ -565,6 +580,7 @@ while IFS= read -r line; do
     *'"type":"prompt"'*)
       printf '%s\n' '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"hello "}}'
       printf '%s\n' 'this is not json'
+      printf '%s\n' '{"type":"extension_ui_request","id":"note-1","method":"notify","message":"fire and forget"}'
       printf '%s\n' '{"type":"extension_ui_request","id":"ui-1","method":"select","title":"Approve bash?","options":["1. Allow","2. Deny"]}'
       ;;
     *)
