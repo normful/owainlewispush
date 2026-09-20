@@ -72,14 +72,16 @@ fn run_checks(cfg: &config::Config) -> CheckReport {
         &mut checks,
     );
     check_history_database(cfg, &mut checks);
-    match cfg.enabled_channel_kinds() {
+    match cfg.enabled_channels() {
         Ok(channels) => {
-            for channel in channels {
-                match channel {
+            for spec in channels {
+                match spec.kind {
                     config::ChannelKind::IMessage => check_imessage_db(cfg, &mut checks),
                     config::ChannelKind::Telegram => check_telegram_config(cfg, &mut checks),
                     config::ChannelKind::Slack => check_slack_config(cfg, &mut checks),
-                    config::ChannelKind::Discord => check_discord_config(cfg, &mut checks),
+                    config::ChannelKind::Discord => {
+                        check_discord_config(cfg, spec.discord_channel_id(), &mut checks)
+                    }
                 }
             }
         }
@@ -94,8 +96,8 @@ fn run_checks(cfg: &config::Config) -> CheckReport {
 /// Checked from configuration alone: there is no bot token on this VM, so
 /// there is nothing to probe with, and the integration is only reachable from
 /// the deployment the config describes.
-fn check_discord_config(cfg: &config::Config, checks: &mut Vec<Check>) {
-    let Some(channel_id) = cfg.discord_channel_id.as_deref() else {
+fn check_discord_config(cfg: &config::Config, channel_id: Option<&str>, checks: &mut Vec<Check>) {
+    let Some(channel_id) = channel_id else {
         checks.push(Check::fail(
             "discord",
             "no guild channel id configured; set discord.channel_id or channel = \"discord:<guild-channel-id>\"",
@@ -158,11 +160,15 @@ fn check_scheduled_delivery(cfg: &config::Config, checks: &mut Vec<Check>) {
         return;
     };
     let result = (|| {
-        let kind = config::ChannelKind::parse(&primary.channel)?;
-        if !cfg.enabled_channel_kinds()?.contains(&kind) {
+        let spec = cfg.resolve_channel_spec(&primary.channel)?;
+        if !cfg
+            .enabled_channels()?
+            .iter()
+            .any(|enabled| enabled.store_key() == spec.store_key())
+        {
             anyhow::bail!("primary channel {:?} is not enabled", primary.channel);
         }
-        let channel = Channel::new_for(cfg, kind)?;
+        let channel = Channel::new_for(cfg, &spec)?;
         channel.primary_target(&primary.target)?;
         Ok::<_, anyhow::Error>(())
     })();

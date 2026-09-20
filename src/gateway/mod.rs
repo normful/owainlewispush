@@ -20,7 +20,7 @@ use crate::agent::Runner;
 use crate::approval::{AnswerOrigin, AnswerOutcome};
 use crate::audit::{AuditEvent, AuditLog};
 use crate::channel::{Channel, InboundImage, InboundVoice, RawMessage};
-use crate::config::{AgentBackend, ChannelKind, Config, PrimaryDeliveryConfig};
+use crate::config::{AgentBackend, ChannelSpec, Config, PrimaryDeliveryConfig};
 use crate::history::{History, OutboundOrigin};
 use crate::jobs;
 use crate::store::Store;
@@ -119,7 +119,7 @@ struct WorkerState {
 impl GatewayGroup {
     pub fn new(cfg: Config) -> Result<Self> {
         jobs::Ledger::capture_legacy_schedule_baseline(&cfg)?;
-        let enabled = cfg.enabled_channel_kinds()?;
+        let enabled = cfg.enabled_channels()?;
         let store = Arc::new(Mutex::new(Store::open(&cfg.paths)?));
         let history = Arc::new(Mutex::new(
             History::open(&cfg.paths.database).with_context(|| {
@@ -132,10 +132,10 @@ impl GatewayGroup {
         let runners = Arc::new(runners(&cfg));
         let audit_lock = Arc::new(Mutex::new(()));
         let mut gateways = Vec::with_capacity(enabled.len());
-        for kind in enabled {
+        for spec in enabled {
             gateways.push(Gateway::new_with_shared(
                 cfg.clone(),
-                kind,
+                spec,
                 store.clone(),
                 history.clone(),
                 runners.clone(),
@@ -175,12 +175,14 @@ impl GatewayGroup {
             .primary_delivery
             .as_ref()
             .context("primary delivery is not configured")?;
-        let kind =
-            ChannelKind::parse(&configured.channel).context("invalid primary delivery channel")?;
+        let spec = self
+            .cfg
+            .resolve_channel_spec(&configured.channel)
+            .context("invalid primary delivery channel")?;
         let gateway = self
             .gateways
             .iter()
-            .find(|gateway| gateway.channel.id() == kind.as_str())
+            .find(|gateway| gateway.channel.store_key() == spec.store_key())
             .with_context(|| {
                 format!(
                     "primary delivery channel {:?} is not enabled in channels",
@@ -192,7 +194,7 @@ impl GatewayGroup {
             .primary_target(&configured.target)
             .context("invalid primary delivery target")?;
         Ok(PrimaryDestination {
-            channel: kind.as_str().to_string(),
+            channel: spec.store_key(),
             target,
         })
     }
@@ -206,7 +208,7 @@ impl GatewayGroup {
         let gateway = self
             .gateways
             .iter()
-            .find(|gateway| gateway.channel.id() == destination.channel)
+            .find(|gateway| gateway.channel.store_key() == destination.channel)
             .context("resolved primary delivery channel is unavailable")?;
         if !reply_to(&gateway.ctx, &destination.target, text).await {
             anyhow::bail!(
@@ -239,7 +241,7 @@ impl GatewayGroup {
         let contexts = self
             .gateways
             .iter()
-            .map(|gateway| (gateway.channel.id().to_string(), gateway.ctx.clone()))
+            .map(|gateway| (gateway.channel.store_key(), gateway.ctx.clone()))
             .collect::<HashMap<_, _>>();
         let receiver = shutdown_rx.clone();
         let scheduler =
@@ -379,24 +381,24 @@ impl Gateway {
             })?,
         ));
         let runners = Arc::new(runners(&cfg));
-        let kind = cfg
-            .enabled_channel_kinds()?
+        let spec = cfg
+            .enabled_channels()?
             .into_iter()
             .next()
             .context("at least one reply channel must be enabled")?;
-        Self::new_with_shared(cfg, kind, store, history, runners, Arc::new(Mutex::new(())))
+        Self::new_with_shared(cfg, spec, store, history, runners, Arc::new(Mutex::new(())))
     }
 
     fn new_with_shared(
         cfg: Config,
-        kind: ChannelKind,
+        spec: ChannelSpec,
         store: Arc<Mutex<Store>>,
         history: Arc<Mutex<History>>,
         runners: Arc<HashMap<AgentBackend, Runner>>,
         audit_lock: Arc<Mutex<()>>,
     ) -> Result<Self> {
         let ack = Arc::new(Mutex::new(AckState::default()));
-        let channel = Channel::new_for(&cfg, kind)?;
+        let channel = Channel::new_for(&cfg, &spec)?;
         let audit = Arc::new(AuditLog::with_lock(
             cfg.paths.audit.clone(),
             cfg.audit_log_content,

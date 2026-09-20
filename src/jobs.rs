@@ -2127,14 +2127,19 @@ fn schedule_migration_destination(cfg: &Config) -> Result<(String, String)> {
         .primary_delivery
         .as_ref()
         .context("primary delivery is not configured")?;
-    let kind = crate::config::ChannelKind::parse(&configured.channel)
+    let spec = cfg
+        .resolve_channel_spec(&configured.channel)
         .context("invalid primary delivery channel")?;
-    if !cfg.enabled_channel_kinds()?.contains(&kind) {
+    if !cfg
+        .enabled_channels()?
+        .iter()
+        .any(|enabled| enabled.store_key() == spec.store_key())
+    {
         bail!("primary delivery channel is not enabled");
     }
-    let channel = crate::channel::Channel::new_for(cfg, kind)?;
+    let channel = crate::channel::Channel::new_for(cfg, &spec)?;
     let target = channel.primary_target(&configured.target)?;
-    Ok((kind.as_str().to_string(), target))
+    Ok((spec.store_key(), target))
 }
 
 fn insert_schedule_review(

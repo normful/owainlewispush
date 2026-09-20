@@ -6,7 +6,7 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 
 use crate::approval::AnswerOrigin;
-use crate::config::{ChannelKind, Config};
+use crate::config::{ChannelKind, ChannelSpec, Config};
 use crate::discord::{self, DiscordChannel};
 use crate::image::DownloadedImage;
 use crate::imessage::{Poller as IMessagePoller, Sender as IMessageSender};
@@ -179,8 +179,8 @@ pub enum Channel {
 }
 
 impl Channel {
-    pub fn new_for(cfg: &Config, kind: ChannelKind) -> Result<Self> {
-        match kind {
+    pub fn new_for(cfg: &Config, spec: &ChannelSpec) -> Result<Self> {
+        match spec.kind {
             ChannelKind::IMessage => Ok(Self::IMessage(IMessageChannel {
                 poller: IMessagePoller::new(cfg.db_path.clone()),
                 sender: IMessageSender::new(),
@@ -212,7 +212,9 @@ impl Channel {
             )?)),
             ChannelKind::Discord => Ok(Self::Discord(DiscordChannel::new(
                 &cfg.discord_base_url()?,
-                cfg.discord_channel_id()?,
+                spec.discord_channel_id()
+                    .context("discord channel is missing its guild channel id")?
+                    .to_string(),
                 cfg.discord_allow_channel_ids.clone(),
             )?)),
         }

@@ -364,24 +364,70 @@ impl Config {
         AgentBackend::parse(&self.agent)
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn channel_kind(&self) -> Result<ChannelKind> {
         ChannelKind::parse(&self.channel)
     }
 
-    pub fn enabled_channel_kinds(&self) -> Result<Vec<ChannelKind>> {
-        if self.channels.is_empty() {
-            return Ok(vec![self.channel_kind()?]);
-        }
+    /// Every enabled channel as a concrete [`ChannelSpec`], one per registered
+    /// push channel. Dedup is by `store_key()`, not by kind, so several Discord
+    /// guild channels can coexist (PLAN §3 / Phase 4).
+    pub fn enabled_channels(&self) -> Result<Vec<ChannelSpec>> {
+        let selectors: Vec<&str> = if self.channels.is_empty() {
+            vec![self.channel.as_str()]
+        } else {
+            self.channels.iter().map(String::as_str).collect()
+        };
         let mut seen = HashSet::new();
-        let mut enabled = Vec::with_capacity(self.channels.len());
-        for name in &self.channels {
-            let kind = ChannelKind::parse(name)?;
-            if !seen.insert(kind) {
-                bail!("duplicate enabled channel {:?}", kind.as_str());
+        let mut enabled = Vec::with_capacity(selectors.len());
+        for selector in selectors {
+            let spec = self.resolve_channel_spec(selector)?;
+            if !seen.insert(spec.store_key()) {
+                bail!("duplicate enabled channel {selector:?}");
             }
-            enabled.push(kind);
+            enabled.push(spec);
         }
         Ok(enabled)
+    }
+
+    /// Projection of [`enabled_channels`] onto kinds, for callers that only need
+    /// the provider (route matching, job backend discovery).
+    pub fn enabled_channel_kinds(&self) -> Result<Vec<ChannelKind>> {
+        Ok(self
+            .enabled_channels()?
+            .into_iter()
+            .map(|spec| spec.kind)
+            .collect())
+    }
+
+    /// Resolves a selector such as `discord:900` or bare `discord` into a
+    /// concrete channel. A bare `discord` falls back to `discord.channel_id`.
+    pub(crate) fn resolve_channel_spec(&self, selector: &str) -> Result<ChannelSpec> {
+        let kind = ChannelKind::parse(selector)?;
+        if kind != ChannelKind::Discord {
+            return Ok(ChannelSpec {
+                kind,
+                instance: None,
+            });
+        }
+        match selector.strip_prefix("discord:") {
+            Some(id) => {
+                let id = id.trim();
+                if !is_discord_snowflake(id) {
+                    bail!(
+                        "discord channel selector {selector:?} must carry a numeric guild channel id"
+                    );
+                }
+                Ok(ChannelSpec {
+                    kind,
+                    instance: Some(id.to_string()),
+                })
+            }
+            None => Ok(ChannelSpec {
+                kind,
+                instance: Some(self.discord_channel_id()?),
+            }),
+        }
     }
 
     pub fn telegram_token(&self) -> Option<String> {
@@ -592,8 +638,8 @@ impl Config {
                 SUPPORTED_VOICE_NAMES.join(", ")
             );
         }
-        for channel in self.enabled_channel_kinds()? {
-            match channel {
+        for spec in self.enabled_channels()? {
+            match spec.kind {
                 ChannelKind::IMessage => {
                     if self.self_handles.is_empty() && self.allow_from.is_empty() {
                         bail!("set imessage.self_handles or imessage.allow_from for iMessage");
@@ -645,7 +691,9 @@ impl Config {
                     // is the operator boundary, exactly as it is for Telegram
                     // chats.
                     self.discord_base_url()?;
-                    let channel_id = self.discord_channel_id()?;
+                    let channel_id = spec
+                        .discord_channel_id()
+                        .context("discord channel is missing its guild channel id")?;
                     if self.discord_allow_channel_ids.is_empty() {
                         bail!(
                             "set discord.allow_channel_ids to the guild channel id Discord answers in"
@@ -947,6 +995,39 @@ impl ChannelKind {
     }
 }
 
+/// A concrete enabled channel: its provider kind plus the instance id for kinds
+/// that support more than one instance (Discord's guild channel id).
+///
+/// `ChannelKind` stays data-less and `Copy` so route matching and every `match`
+/// arm over kinds is unchanged; the instance lives here, where the channel
+/// registry needs it (PLAN §3 / Phase 4).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ChannelSpec {
+    pub kind: ChannelKind,
+    /// `Some(guild-channel-id)` for Discord, `None` for single-instance kinds.
+    pub instance: Option<String>,
+}
+
+impl ChannelSpec {
+    /// The durable identity used for cursors, history, jobs, and the audit log.
+    /// Unique per instance, unlike the bare kind, so two Discord guild channels
+    /// cannot collide.
+    pub fn store_key(&self) -> String {
+        match (self.kind, self.instance.as_deref()) {
+            (ChannelKind::Discord, Some(id)) => format!("discord:{id}"),
+            _ => self.kind.as_str().to_string(),
+        }
+    }
+
+    pub fn discord_channel_id(&self) -> Option<&str> {
+        if self.kind == ChannelKind::Discord {
+            self.instance.as_deref()
+        } else {
+            None
+        }
+    }
+}
+
 /// A Discord snowflake: all digits and small enough to stay an exact `i64`,
 /// which is what push uses as a channel row id.
 fn is_discord_snowflake(value: &str) -> bool {
@@ -957,29 +1038,30 @@ fn is_discord_snowflake(value: &str) -> bool {
         && value.parse::<i64>().is_ok()
 }
 
-/// Records the guild channel id carried by a `discord:<id>` selector, so
-/// `channel = "discord:123"` is enough to configure the channel. An explicit
-/// `discord.channel_id` that disagrees is a configuration error rather than a
-/// silent winner.
+/// Records the guild channel id carried by a `discord:<id>` selector on the
+/// **primary** `channel` setting, so `channel = "discord:123"` is enough to
+/// configure a single Discord channel (and a bare `discord` can fall back to
+/// `discord.channel_id`). The `channels` list is deliberately *not* collapsed
+/// here: several `discord:<id>` selectors each resolve their own id through
+/// [`Config::enabled_channels`] (PLAN §3 / Phase 4). An explicit
+/// `discord.channel_id` that disagrees with the primary selector is still a
+/// configuration error rather than a silent winner.
 fn apply_discord_channel_selector(cfg: &mut Config) -> Result<()> {
-    let selectors =
-        std::iter::once(cfg.channel.as_str()).chain(cfg.channels.iter().map(String::as_str));
-    for selector in selectors {
-        let Some(id) = selector.strip_prefix("discord:") else {
-            continue;
-        };
-        let id = id.trim();
-        if !is_discord_snowflake(id) {
-            bail!("discord channel selector {selector:?} must carry a numeric guild channel id");
+    let selector = cfg.channel.as_str();
+    let Some(id) = selector.strip_prefix("discord:") else {
+        return Ok(());
+    };
+    let id = id.trim();
+    if !is_discord_snowflake(id) {
+        bail!("discord channel selector {selector:?} must carry a numeric guild channel id");
+    }
+    match cfg.discord_channel_id.as_deref().map(str::trim) {
+        Some(existing) if !existing.is_empty() && existing != id => {
+            bail!(
+                "discord channel selector {selector:?} conflicts with discord.channel_id {existing:?}"
+            )
         }
-        match cfg.discord_channel_id.as_deref().map(str::trim) {
-            Some(existing) if !existing.is_empty() && existing != id => {
-                bail!(
-                    "discord channel selector {selector:?} conflicts with discord.channel_id {existing:?}"
-                )
-            }
-            _ => cfg.discord_channel_id = Some(id.to_string()),
-        }
+        _ => cfg.discord_channel_id = Some(id.to_string()),
     }
     Ok(())
 }
@@ -1132,9 +1214,8 @@ mod tests {
             "https://discord.int.exe.xyz"
         );
 
-        // Phase 3 registers exactly one guild channel. A second, different id
-        // is a configuration error rather than a silently ignored selector,
-        // because `ChannelKind` carries no guild channel id yet (Phase 4).
+        // Phase 4: several guild channels coexist, each its own push channel.
+        // Dedup is by `store_key`, not by kind.
         std::fs::write(
             &path,
             format!(
@@ -1143,16 +1224,41 @@ mod tests {
             ),
         )
         .unwrap();
-        let error = Config::load_with_paths(
+        let multi = Config::load_with_paths(
+            path.to_str().unwrap(),
+            PushPaths::from_root(root.join("runtime")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            multi.enabled_channel_kinds().unwrap(),
+            vec![ChannelKind::Discord, ChannelKind::Discord]
+        );
+        assert_eq!(
+            multi
+                .enabled_channels()
+                .unwrap()
+                .iter()
+                .map(ChannelSpec::store_key)
+                .collect::<Vec<_>>(),
+            vec!["discord:900".to_string(), "discord:901".to_string()]
+        );
+        // A repeated selector is still rejected.
+        std::fs::write(
+            &path,
+            format!(
+                "channels = [\"discord:900\", \"discord:900\"]\nagent = \"pi\"\nassistant_root = \"{}\"\n\n[discord]\nbase_url = \"discord.int.exe.xyz\"\nallow_channel_ids = [\"900\"]\n",
+                assistant.to_string_lossy()
+            ),
+        )
+        .unwrap();
+        let duplicate = Config::load_with_paths(
             path.to_str().unwrap(),
             PushPaths::from_root(root.join("runtime")).unwrap(),
         )
         .unwrap_err();
         assert!(
-            error
-                .to_string()
-                .contains("conflicts with discord.channel_id"),
-            "{error}"
+            duplicate.to_string().contains("duplicate enabled channel"),
+            "{duplicate}"
         );
 
         let _ = std::fs::remove_dir_all(root);
