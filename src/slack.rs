@@ -661,6 +661,7 @@ impl Inbox {
                             data: None,
                         })
                         .collect(),
+                    files: Vec::new(),
                     is_from_me: row.get(8)?,
                     is_supported: row.get(9)?,
                     thread_id: None,

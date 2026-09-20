@@ -11,6 +11,7 @@ use tokio::sync::{mpsc, watch};
 use tracing::{error, info, warn};
 
 use crate::agent::{Request, RunError};
+use crate::attachments::{DownloadedFile, PreparedFiles, MAX_FILE_BYTES, MAX_FILE_COUNT};
 use crate::history::{DeliveryStatus, OutboundMessage, OutboundOrigin};
 use crate::image::{PreparedImages, MAX_IMAGE_BYTES, MAX_IMAGE_COUNT};
 use crate::prompt::{ComposedPrompt, Composer};
@@ -102,7 +103,7 @@ where
         }
     }
 
-    if job.image_attachments.is_empty() {
+    if job.image_attachments.is_empty() && job.file_attachments.is_empty() {
         if let Some(reply) = command(ctx, &job) {
             let delivery = record_and_deliver(ctx, &job, OutboundOrigin::Gateway, &reply).await;
             if delivery.is_ok() {
@@ -255,9 +256,43 @@ where
             }
         }
     };
-    let image_paths = prepared_images
+    let mut attachment_paths = prepared_images
         .as_ref()
         .map_or_else(Vec::new, |images| images.paths().to_vec());
+    let prepared_files = if job.file_attachments.is_empty() {
+        None
+    } else {
+        match prepare_files(ctx, &job).await {
+            Ok(files) => Some(files),
+            Err(error) => {
+                warn!("[{}] {error:#}", job.thread);
+                audit(
+                    ctx,
+                    ctx.audit.failed(
+                        "file_preparation_failed",
+                        job.row_id,
+                        &job.thread,
+                        Some(job.backend),
+                        error.to_string(),
+                    ),
+                );
+                let reply = "I could not use that attachment. Send up to 4 files with a combined size under 8 MiB, then try again.";
+                let delivery = record_and_deliver(ctx, &job, OutboundOrigin::Gateway, reply).await;
+                report_delivery(
+                    ctx,
+                    &job,
+                    delivery,
+                    reply,
+                    "file_preparation_failed",
+                    "deliver file fallback",
+                );
+                return;
+            }
+        }
+    };
+    if let Some(files) = prepared_files.as_ref() {
+        attachment_paths.extend_from_slice(files.paths());
+    }
 
     let run = async {
         let mut session_id = session_id;
@@ -298,7 +333,7 @@ where
                     is_new,
                     &work_dir,
                     &prompt,
-                    &image_paths,
+                    &attachment_paths,
                     job.model.as_deref(),
                     job.thinking.as_deref(),
                 ),
@@ -321,7 +356,7 @@ where
                                 false,
                                 &work_dir,
                                 &prompt,
-                                &image_paths,
+                                &attachment_paths,
                                 job.model.as_deref(),
                                 job.thinking.as_deref(),
                             ),
@@ -383,7 +418,7 @@ where
                         true,
                         &work_dir,
                         &prompt,
-                        &image_paths,
+                        &attachment_paths,
                         job.model.as_deref(),
                         job.thinking.as_deref(),
                     ),
@@ -422,6 +457,7 @@ where
     };
     drop(run);
     drop(prepared_images);
+    drop(prepared_files);
 
     match result {
         Some(Ok(out)) => {
@@ -713,6 +749,38 @@ async fn prepare_images(ctx: &Ctx, job: &Job) -> Result<PreparedImages> {
         downloaded.push(image);
     }
     PreparedImages::create(&ctx.cfg.paths.cache, downloaded)
+}
+
+async fn prepare_files(ctx: &Ctx, job: &Job) -> Result<PreparedFiles> {
+    if job.file_attachments.len() > MAX_FILE_COUNT {
+        anyhow::bail!("message has more than {MAX_FILE_COUNT} files");
+    }
+    let declared_total = job
+        .file_attachments
+        .iter()
+        .filter_map(|file| file.file_size)
+        .try_fold(0usize, |total, size| total.checked_add(size))
+        .context("attachment size overflow")?;
+    if declared_total > MAX_FILE_BYTES {
+        anyhow::bail!("attachments exceed the 8 MiB limit");
+    }
+
+    let mut downloaded = Vec::with_capacity(job.file_attachments.len());
+    let mut actual_total = 0usize;
+    for attachment in &job.file_attachments {
+        let file = ctx.channel.download_file(attachment).await?;
+        actual_total = actual_total
+            .checked_add(file.bytes.len())
+            .context("attachment size overflow")?;
+        if actual_total > MAX_FILE_BYTES {
+            anyhow::bail!("attachments exceed the 8 MiB limit");
+        }
+        downloaded.push(DownloadedFile {
+            bytes: file.bytes,
+            filename: file.filename,
+        });
+    }
+    PreparedFiles::create(&ctx.cfg.paths.cache, downloaded)
 }
 
 /// Error and completion labels for one gateway-authored reply flow.

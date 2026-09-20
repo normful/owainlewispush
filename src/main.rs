@@ -5,6 +5,7 @@
 mod agent;
 mod approval;
 mod assistant;
+mod attachments;
 mod audit;
 mod channel;
 mod claude;

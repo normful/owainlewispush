@@ -19,7 +19,7 @@ use tracing::{error, info, warn};
 use crate::agent::Runner;
 use crate::approval::{AnswerOrigin, AnswerOutcome};
 use crate::audit::{AuditEvent, AuditLog};
-use crate::channel::{Channel, InboundImage, InboundVoice, RawMessage};
+use crate::channel::{Channel, InboundFile, InboundImage, InboundVoice, RawMessage};
 use crate::config::{AgentBackend, ChannelSpec, Config, PrimaryDeliveryConfig};
 use crate::history::{History, OutboundOrigin};
 use crate::jobs;
@@ -48,6 +48,7 @@ struct Job {
     reply_with_voice: bool,
     voice_attachment: Option<InboundVoice>,
     image_attachments: Vec<InboundImage>,
+    file_attachments: Vec<InboundFile>,
     approval_origin: AnswerOrigin,
 }
 
@@ -70,6 +71,8 @@ struct Ctx {
     setup_failure_replies: Arc<Mutex<Vec<String>>>,
     #[cfg(test)]
     sent_replies: Arc<Mutex<Vec<(String, String)>>>,
+    #[cfg(test)]
+    sent_attachments: Arc<Mutex<Vec<(String, String)>>>,
     #[cfg(test)]
     sent_voice_replies: SentVoiceReplies,
     #[cfg(test)]
@@ -434,6 +437,8 @@ impl Gateway {
             #[cfg(test)]
             sent_replies: Arc::new(Mutex::new(Vec::new())),
             #[cfg(test)]
+            sent_attachments: Arc::new(Mutex::new(Vec::new())),
+            #[cfg(test)]
             sent_voice_replies: Arc::new(Mutex::new(Vec::new())),
             #[cfg(test)]
             send_failures_remaining: Arc::new(Mutex::new(0)),
@@ -720,11 +725,13 @@ impl Gateway {
                     "[Voice message]".to_string()
                 } else if m.text.trim().is_empty() && !m.images.is_empty() {
                     "[Image attachment]".to_string()
+                } else if m.text.trim().is_empty() && !m.files.is_empty() {
+                    "[File attachment]".to_string()
                 } else {
                     m.text.trim().to_string()
                 };
                 let approval_origin = self.channel.approval_origin(m, &thread);
-                let approval = if reply_with_voice || !m.images.is_empty() {
+                let approval = if reply_with_voice || !m.images.is_empty() || !m.files.is_empty() {
                     Ok(AnswerOutcome::NotAnAnswer)
                 } else {
                     self.ctx.history.lock().unwrap().answer_question(
@@ -925,9 +932,12 @@ impl Gateway {
                     reply_with_voice,
                     voice_attachment: m.voice.clone(),
                     image_attachments: m.images.clone(),
+                    file_attachments: m.files.clone(),
                     approval_origin,
                 };
-                if job.image_attachments.is_empty() && job.text.trim().eq_ignore_ascii_case("/stop")
+                if job.image_attachments.is_empty()
+                    && job.file_attachments.is_empty()
+                    && job.text.trim().eq_ignore_ascii_case("/stop")
                 {
                     if !self.stop(job).await {
                         return;
@@ -1297,19 +1307,32 @@ async fn send_reply_chunk(
         if should_fail {
             anyhow::bail!("send failed");
         }
-        ctx.sent_replies
-            .lock()
-            .unwrap()
-            .push((target.to_string(), chunk.text.clone()));
+        if let Some(attachment) = &chunk.attachment {
+            ctx.sent_attachments
+                .lock()
+                .unwrap()
+                .push((target.to_string(), attachment.path.clone()));
+        } else {
+            ctx.sent_replies
+                .lock()
+                .unwrap()
+                .push((target.to_string(), chunk.text.clone()));
+        }
         Ok(())
     }
     #[cfg(not(test))]
     {
         let timeout = ctx.channel.delivery_semantics().send_timeout;
+        let send = async {
+            match &chunk.attachment {
+                Some(attachment) => ctx.channel.send_attachment(target, attachment).await,
+                None => ctx.channel.send_chunk(target, chunk).await,
+            }
+        };
         if timeout.is_zero() {
-            ctx.channel.send_chunk(target, chunk).await
+            send.await
         } else {
-            match tokio::time::timeout(timeout, ctx.channel.send_chunk(target, chunk)).await {
+            match tokio::time::timeout(timeout, send).await {
                 Ok(result) => result,
                 Err(_) => anyhow::bail!("send timed out"),
             }

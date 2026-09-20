@@ -20,7 +20,10 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use crate::channel::{InboundImage, InboundVoice, RawMessage};
+use crate::attachments::DownloadedFile;
+use crate::channel::{
+    InboundFile, InboundImage, InboundVoice, OutboundAttachment, OutboundChunk, RawMessage,
+};
 use crate::image::{DownloadedImage, MAX_IMAGE_BYTES};
 use crate::voice::{AudioClip, MAX_AUDIO_BYTES};
 
@@ -61,6 +64,12 @@ pub const VOICE_MESSAGE_FLAG: u64 = 1 << 13;
 /// this file, which asserts both halves of that claim against a local socket.
 pub const USER_AGENT: &str =
     "Mozilla/5.0 (compatible; push/0.10.0; +https://github.com/owainlewis/push)";
+
+/// Largest file push will attach to a reply. The two-step upload bypasses the
+/// integration's 256 KiB body cap, so this is Discord's own upload ceiling kept
+/// conservative. An oversize directive stays as literal text rather than
+/// wedging delivery in an infinite retry.
+pub const MAX_ATTACHMENT_BYTES: usize = 8 * 1024 * 1024;
 
 /// A page of `GET /channels/{id}/messages`. The API caps this at 100.
 const POLL_LIMIT: usize = 100;
@@ -637,6 +646,7 @@ pub(crate) fn discord_message_to_raw(
         || bot_user_id.is_some_and(|bot| bot == author_id);
     let mut voice = None;
     let mut images = Vec::new();
+    let mut files = Vec::new();
     for attachment in &message.attachments {
         let content_type = attachment.content_type.as_deref().unwrap_or_default();
         // A voice note is an audio attachment, or a flagged voice message whose
@@ -668,6 +678,19 @@ pub(crate) fn discord_message_to_raw(
                 mime_type: Some(content_type.to_string()),
                 data: None,
             });
+        } else {
+            // Everything else — PDFs, spreadsheets, archives — is passed to the
+            // backend as an opaque `@path` file (PLAN §5).
+            files.push(InboundFile {
+                locator: attachment.url.clone(),
+                filename: if attachment.filename.is_empty() {
+                    "attachment".to_string()
+                } else {
+                    attachment.filename.clone()
+                },
+                file_size: attachment.size,
+                data: None,
+            });
         }
     }
     Ok(RawMessage {
@@ -680,6 +703,7 @@ pub(crate) fn discord_message_to_raw(
         text: message.content,
         voice,
         images,
+        files,
         is_from_me,
         is_supported: true,
         thread_id: None,
@@ -1172,6 +1196,135 @@ fn validated_attachment_url(url: &str) -> Result<&str> {
 }
 
 // ---------------------------------------------------------------------------
+// Outbound attachments (PLAN §5)
+// ---------------------------------------------------------------------------
+
+/// The reply directive a backend emits to attach a file. It must be on its own
+/// line; push removes the line from the delivered text. The token is
+/// deliberately distinctive so ordinary prose cannot collide with it.
+///
+/// ```text
+/// [send-file: reports/summary.pdf]
+/// ```
+pub const ATTACHMENT_DIRECTIVE_PREFIX: &str = "[send-file:";
+
+/// Parses one reply line as an attachment directive, returning the raw path.
+fn parse_attachment_directive(line: &str) -> Option<&str> {
+    let trimmed = line.trim();
+    let inner = trimmed
+        .strip_prefix(ATTACHMENT_DIRECTIVE_PREFIX)?
+        .strip_suffix(']')?;
+    Some(inner.trim())
+}
+
+/// Resolves a directive path to an existing file under the assistant root.
+/// Anything outside the root, absolute, containing `..`, missing, a directory,
+/// or larger than [`MAX_ATTACHMENT_BYTES`] yields `None`, and the caller leaves
+/// the directive as literal text rather than silently dropping it.
+fn resolve_attachment(assistant_dir: &str, raw: &str) -> Option<OutboundAttachment> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let candidate = std::path::Path::new(raw);
+    if candidate.is_absolute()
+        || candidate
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return None;
+    }
+    let root = std::fs::canonicalize(assistant_dir).ok()?;
+    let canonical = std::fs::canonicalize(root.join(candidate)).ok()?;
+    if !canonical.starts_with(&root) {
+        return None;
+    }
+    let metadata = std::fs::metadata(&canonical).ok()?;
+    if !metadata.is_file() || metadata.len() > MAX_ATTACHMENT_BYTES as u64 {
+        return None;
+    }
+    let filename = canonical.file_name()?.to_string_lossy().to_string();
+    Some(OutboundAttachment {
+        path: canonical.to_string_lossy().to_string(),
+        filename,
+    })
+}
+
+/// Maps a filename to a content type for the pre-signed `PUT`. Discord infers
+/// the type from the filename regardless, so a miss is harmless.
+pub fn attachment_content_type(filename: &str) -> &'static str {
+    let extension = filename
+        .rsplit('.')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match extension.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "pdf" => "application/pdf",
+        "txt" | "md" | "log" => "text/plain",
+        "csv" => "text/csv",
+        "json" => "application/json",
+        "ogg" => "audio/ogg",
+        "mp3" => "audio/mpeg",
+        "wav" => "audio/wav",
+        "mp4" => "video/mp4",
+        "zip" => "application/zip",
+        _ => "application/octet-stream",
+    }
+}
+
+/// Builds the delivery plan for one reply: the reply text chunked by the
+/// measured contract, with an attachment chunk wherever a resolvable
+/// `[send-file: …]` directive appears, in source order. Directive lines inside
+/// code fences are never treated as directives.
+pub(crate) fn discord_outbound_chunks(text: &str, assistant_dir: &str) -> Vec<OutboundChunk> {
+    let mut chunks = Vec::new();
+    let mut buffer = String::new();
+    let mut fence_open = false;
+    for line in text.split_inclusive('\n') {
+        if is_fence_line(line.trim_start()) {
+            fence_open = !fence_open;
+            buffer.push_str(line);
+            continue;
+        }
+        if !fence_open {
+            if let Some(raw) = parse_attachment_directive(line) {
+                if let Some(attachment) = resolve_attachment(assistant_dir, raw) {
+                    flush_text_chunks(&mut buffer, &mut chunks);
+                    chunks.push(OutboundChunk {
+                        text: String::new(),
+                        rich_markdown: true,
+                        attachment: Some(attachment),
+                    });
+                    continue;
+                }
+            }
+        }
+        buffer.push_str(line);
+    }
+    flush_text_chunks(&mut buffer, &mut chunks);
+    chunks
+}
+
+fn flush_text_chunks(buffer: &mut String, chunks: &mut Vec<OutboundChunk>) {
+    if buffer.trim().is_empty() {
+        buffer.clear();
+        return;
+    }
+    for text in discord_chunks(buffer) {
+        chunks.push(OutboundChunk {
+            text,
+            rich_markdown: true,
+            attachment: None,
+        });
+    }
+    buffer.clear();
+}
+
+// ---------------------------------------------------------------------------
 // The channel
 // ---------------------------------------------------------------------------
 
@@ -1191,16 +1344,24 @@ pub struct DiscordChannel {
     send_route: Arc<str>,
     #[allow(dead_code)]
     upload_route: Arc<str>,
+    /// Assistant root, used to resolve reply attachment directives (PLAN §5).
+    assistant_dir: Arc<str>,
     client: HttpClient,
 }
 
 impl DiscordChannel {
-    pub fn new(base_url: &str, channel_id: String, allow_channel_ids: Vec<String>) -> Result<Self> {
+    pub fn new(
+        base_url: &str,
+        channel_id: String,
+        allow_channel_ids: Vec<String>,
+        assistant_dir: String,
+    ) -> Result<Self> {
         let transport = Arc::new(ReqwestTransport::new()?);
         Ok(Self::with_transport(
             base_url,
             channel_id,
             allow_channel_ids,
+            assistant_dir,
             transport,
             RequestLimiter::shared(),
         ))
@@ -1210,6 +1371,7 @@ impl DiscordChannel {
         base_url: &str,
         channel_id: String,
         allow_channel_ids: Vec<String>,
+        assistant_dir: String,
         transport: Arc<dyn Transport>,
         limiter: RequestLimiter,
     ) -> Self {
@@ -1222,6 +1384,7 @@ impl DiscordChannel {
             upload_route: Arc::from(format!("upload:{channel_id}")),
             store_key: Arc::from(format!("discord:{channel_id}")),
             channel_id: Arc::from(channel_id),
+            assistant_dir: Arc::from(assistant_dir),
             bot_user_id: Arc::new(Mutex::new(None)),
             client: HttpClient { transport, limiter },
         }
@@ -1233,6 +1396,11 @@ impl DiscordChannel {
 
     pub fn store_key(&self) -> &str {
         &self.store_key
+    }
+
+    /// Assistant root used to resolve reply attachment directives.
+    pub(crate) fn assistant_dir(&self) -> &str {
+        &self.assistant_dir
     }
 
     pub fn bot_user_id(&self) -> Option<String> {
@@ -1390,6 +1558,33 @@ impl DiscordChannel {
             .to_string())
     }
 
+    /// Reads a validated reply attachment from disk and delivers it as a
+    /// Discord message attachment. The path was resolved and size-checked when
+    /// the reply was parsed (PLAN §5).
+    pub async fn send_attachment(
+        &self,
+        _target: &str,
+        attachment: &OutboundAttachment,
+    ) -> Result<()> {
+        let bytes = std::fs::read(&attachment.path)
+            .with_context(|| format!("read reply attachment {}", attachment.path))?;
+        if bytes.len() > MAX_ATTACHMENT_BYTES {
+            bail!("reply attachment exceeds the {MAX_ATTACHMENT_BYTES} byte limit");
+        }
+        let content_type = attachment_content_type(&attachment.filename);
+        self.upload_attachment(
+            AttachmentUpload {
+                filename: &attachment.filename,
+                bytes: &bytes,
+                content_type,
+                voice: None,
+            },
+            "",
+        )
+        .await?;
+        Ok(())
+    }
+
     pub async fn download_voice(&self, voice: &InboundVoice) -> Result<AudioClip> {
         if let Some(bytes) = &voice.data {
             return Ok(AudioClip {
@@ -1435,6 +1630,32 @@ impl DiscordChannel {
             .await?;
         Ok(DownloadedImage { bytes })
     }
+
+    /// Downloads a non-image inbound attachment from the CDN (PLAN §5). The
+    /// bytes are opaque; `crate::attachments` names the temporary file.
+    pub async fn download_file(&self, file: &InboundFile) -> Result<DownloadedFile> {
+        if let Some(bytes) = &file.data {
+            return Ok(DownloadedFile {
+                bytes: bytes.clone(),
+                filename: file.filename.clone(),
+            });
+        }
+        if file
+            .file_size
+            .is_some_and(|size| size > crate::attachments::MAX_FILE_BYTES)
+        {
+            bail!("Discord attachment exceeds the 8 MiB limit");
+        }
+        let url = validated_attachment_url(&file.locator)?;
+        let bytes = self
+            .client
+            .get_bytes(url, "cdn", crate::attachments::MAX_FILE_BYTES, "attachment")
+            .await?;
+        Ok(DownloadedFile {
+            bytes,
+            filename: file.filename.clone(),
+        })
+    }
 }
 
 /// A transport for the `ChannelContract` tests in `crate::channel`, which
@@ -1479,6 +1700,7 @@ impl DiscordChannel {
             DEFAULT_BASE_URL,
             channel_id.to_string(),
             allow_channel_ids.iter().map(|id| id.to_string()).collect(),
+            String::new(),
             Arc::new(NullTransport),
             RequestLimiter::new(Duration::ZERO),
         );
@@ -1659,6 +1881,7 @@ mod tests {
             DEFAULT_BASE_URL,
             "900".to_string(),
             vec!["900".to_string()],
+            std::env::temp_dir().to_string_lossy().to_string(),
             transport,
             // Pacing is disabled for tests; the limiter itself is exercised
             // separately.
@@ -1677,6 +1900,7 @@ mod tests {
             text: text.to_string(),
             voice: None,
             images: Vec::new(),
+            files: Vec::new(),
             is_from_me: false,
             is_supported: true,
             thread_id: None,
@@ -1918,7 +2142,9 @@ mod tests {
                 {"filename": "voice-message.ogg", "content_type": "audio/ogg",
                  "size": 4242, "url": "https://cdn.discordapp.com/attachments/900/1/voice-message.ogg"},
                 {"filename": "chart.png", "content_type": "image/png",
-                 "size": 12, "url": "https://cdn.discordapp.com/attachments/900/2/chart.png"}
+                 "size": 12, "url": "https://cdn.discordapp.com/attachments/900/2/chart.png"},
+                {"filename": "report.pdf", "content_type": "application/pdf",
+                 "size": 99, "url": "https://cdn.discordapp.com/attachments/900/3/report.pdf"}
             ]
         }))
         .unwrap();
@@ -1937,6 +2163,12 @@ mod tests {
         assert_eq!(
             raw.images[0].locator,
             "https://cdn.discordapp.com/attachments/900/2/chart.png"
+        );
+        assert_eq!(raw.files.len(), 1);
+        assert_eq!(raw.files[0].filename, "report.pdf");
+        assert_eq!(
+            raw.files[0].locator,
+            "https://cdn.discordapp.com/attachments/900/3/report.pdf"
         );
 
         let own: DiscordMessage = serde_json::from_value(json!({
@@ -2109,6 +2341,152 @@ mod tests {
         );
     }
 
+    // -- outbound attachments (PLAN §5) ------------------------------------
+
+    fn attachment_channel(transport: Arc<FakeTransport>, assistant_dir: &str) -> DiscordChannel {
+        DiscordChannel::with_transport(
+            DEFAULT_BASE_URL,
+            "900".to_string(),
+            vec!["900".to_string()],
+            assistant_dir.to_string(),
+            transport,
+            RequestLimiter::new(Duration::ZERO),
+        )
+    }
+
+    #[test]
+    fn reply_directives_become_attachment_chunks_in_source_order() {
+        let dir = crate::test_support::temp_dir("outbound-attachments");
+        std::fs::write(dir.join("report.txt"), b"hello").unwrap();
+        let root = dir.to_string_lossy().to_string();
+
+        let chunks =
+            discord_outbound_chunks("Here is the report.\n[send-file: report.txt]\nDone.", &root);
+
+        assert_eq!(chunks.len(), 3);
+        assert_eq!(chunks[0].text.trim(), "Here is the report.");
+        assert!(chunks[0].attachment.is_none());
+        assert!(chunks[1].text.is_empty());
+        let attachment = chunks[1].attachment.clone().unwrap();
+        assert_eq!(attachment.filename, "report.txt");
+        assert_eq!(
+            attachment.path,
+            std::fs::canonicalize(dir.join("report.txt"))
+                .unwrap()
+                .to_string_lossy()
+        );
+        assert_eq!(chunks[2].text.trim(), "Done.");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn unresolvable_directives_stay_literal_and_fences_are_not_directives() {
+        let dir = crate::test_support::temp_dir("bad-attachments");
+        std::fs::write(dir.join("report.txt"), b"hello").unwrap();
+        let root = dir.to_string_lossy().to_string();
+
+        let chunks = discord_outbound_chunks(
+            "[send-file: missing.txt]\n[send-file: /etc/passwd]\n[send-file: ../escape]\n```\n[send-file: report.txt]\n```",
+            &root,
+        );
+        assert!(
+            chunks.iter().all(|chunk| chunk.attachment.is_none()),
+            "only a fenced directive exists and it must not count"
+        );
+        let joined: String = chunks.iter().map(|chunk| chunk.text.clone()).collect();
+        assert!(joined.contains("[send-file: missing.txt]"));
+        assert!(joined.contains("[send-file: /etc/passwd]"));
+        assert!(joined.contains("[send-file: ../escape]"));
+        assert!(joined.contains("[send-file: report.txt]"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn the_channel_contract_surfaces_attachment_chunks() {
+        let dir = crate::test_support::temp_dir("contract-outbound-attachments");
+        std::fs::write(dir.join("note.txt"), b"hi").unwrap();
+        let channel = crate::channel::Channel::Discord(attachment_channel(
+            Arc::new(FakeTransport::default()),
+            &dir.to_string_lossy(),
+        ));
+
+        let chunks = channel.outbound_chunks("see this\n[send-file: note.txt]", "");
+
+        assert_eq!(chunks.iter().filter(|c| c.attachment.is_some()).count(), 1);
+        assert_eq!(chunks[0].text.trim(), "see this");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn attachment_content_types_are_mapped_by_extension() {
+        assert_eq!(attachment_content_type("a.PNG"), "image/png");
+        assert_eq!(attachment_content_type("report.pdf"), "application/pdf");
+        assert_eq!(attachment_content_type("notes.md"), "text/plain");
+        assert_eq!(attachment_content_type("blob"), "application/octet-stream");
+    }
+
+    #[tokio::test]
+    async fn send_attachment_reads_the_file_and_runs_the_two_step_upload() {
+        let dir = crate::test_support::temp_dir("send-attachment");
+        std::fs::write(dir.join("note.txt"), b"hello").unwrap();
+        let file = std::fs::canonicalize(dir.join("note.txt")).unwrap();
+        let fake = Arc::new(FakeTransport::with_raw(vec![
+            json_response(
+                200,
+                json!({"attachments": [{
+                    "id": 0,
+                    "upload_filename": "u/note.txt",
+                    "upload_url": "https://discord-attachments-uploads-prd.storage.googleapis.com/u/note.txt?upload_id=t"
+                }]}),
+            ),
+            TransportResponse {
+                status: 200,
+                retry_after: None,
+                body: Vec::new(),
+            },
+            json_response(200, json!({"id": "9"})),
+        ]));
+        let channel = attachment_channel(fake.clone(), &dir.to_string_lossy());
+
+        channel
+            .send_attachment(
+                "900",
+                &OutboundAttachment {
+                    path: file.to_string_lossy().to_string(),
+                    filename: "note.txt".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            fake.calls(),
+            vec![
+                Call::PostJson(
+                    format!("{DEFAULT_BASE_URL}{API_PREFIX}/channels/900/attachments"),
+                    json!({"files": [{"filename": "note.txt", "file_size": 5, "id": 0}]})
+                ),
+                Call::PutBytes(
+                    "https://discord-attachments-uploads-prd.storage.googleapis.com/u/note.txt?upload_id=t"
+                        .to_string(),
+                    "text/plain".to_string(),
+                    b"hello".to_vec()
+                ),
+                Call::PostJson(
+                    format!("{DEFAULT_BASE_URL}{API_PREFIX}/channels/900/messages"),
+                    json!({
+                        "attachments": [{
+                            "id": 0,
+                            "filename": "note.txt",
+                            "uploaded_filename": "u/note.txt"
+                        }]
+                    })
+                ),
+            ]
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[tokio::test]
     async fn downloads_voice_and_image_bytes_from_the_cdn() {
         let fake = Arc::new(FakeTransport::with_raw(vec![
@@ -2159,6 +2537,35 @@ mod tests {
                     "https://cdn.discordapp.com/attachments/900/2/chart.png".to_string()
                 ),
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn downloads_a_generic_attachment_from_the_cdn() {
+        let fake = Arc::new(FakeTransport::with_raw(vec![TransportResponse {
+            status: 200,
+            retry_after: None,
+            body: b"%PDF-1.7".to_vec(),
+        }]));
+        let channel = channel(fake.clone());
+
+        let file = channel
+            .download_file(&InboundFile {
+                locator: "https://cdn.discordapp.com/attachments/900/3/report.pdf".to_string(),
+                filename: "report.pdf".to_string(),
+                file_size: Some(8),
+                data: None,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(file.bytes, b"%PDF-1.7");
+        assert_eq!(file.filename, "report.pdf");
+        assert_eq!(
+            fake.calls(),
+            vec![Call::GetBytes(
+                "https://cdn.discordapp.com/attachments/900/3/report.pdf".to_string()
+            )]
         );
     }
 

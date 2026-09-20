@@ -393,6 +393,7 @@ mod tests {
             text: "secret request".to_string(),
             voice: None,
             images: Vec::new(),
+            files: Vec::new(),
             is_from_me: false,
             is_supported: true,
             thread_id: None,

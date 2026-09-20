@@ -6,6 +6,7 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 
 use crate::approval::AnswerOrigin;
+use crate::attachments::DownloadedFile;
 use crate::config::{ChannelKind, ChannelSpec, Config};
 use crate::discord::{self, DiscordChannel};
 use crate::image::DownloadedImage;
@@ -39,6 +40,20 @@ pub struct InboundImage {
     pub data: Option<Vec<u8>>,
 }
 
+/// A non-image inbound attachment (PLAN §5). push does not inspect the bytes;
+/// it writes them to a temporary file and hands the path to the backend as
+/// `@path`, exactly like an image.
+#[derive(Debug, Clone)]
+pub struct InboundFile {
+    /// Channel-owned file identifier. The gateway treats this as opaque.
+    pub locator: String,
+    /// Display filename from the provider, used only to name the temp file.
+    pub filename: String,
+    pub file_size: Option<usize>,
+    /// Tests and channels that already own the bytes may provide them directly.
+    pub data: Option<Vec<u8>>,
+}
+
 #[derive(Debug, Clone)]
 pub struct RawMessage {
     pub row_id: i64,
@@ -52,6 +67,8 @@ pub struct RawMessage {
     pub text: String,
     pub voice: Option<InboundVoice>,
     pub images: Vec<InboundImage>,
+    /// Non-image attachments, delivered to the backend as `@path` (PLAN §5).
+    pub files: Vec<InboundFile>,
     pub is_from_me: bool,
     pub is_supported: bool,
     /// Channel-specific thread/topic id (Telegram `message_thread_id`).
@@ -67,10 +84,26 @@ impl RawMessage {
     }
 }
 
+/// One file to deliver with a reply (PLAN §5). The path is resolved and
+/// validated under the assistant root when the reply is parsed, and the
+/// directive that produced it stays in the durable outbound `content`, so
+/// delivery can rebuild the same attachment list after a crash.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutboundAttachment {
+    /// Absolute, canonicalized path under the assistant root.
+    pub path: String,
+    /// Display filename sent to the provider.
+    pub filename: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutboundChunk {
     pub text: String,
     pub rich_markdown: bool,
+    /// `Some` when this chunk is an attachment rather than text. The durable
+    /// `delivery_chunk_index` covers attachments identically, so an interrupted
+    /// multi-item reply resumes at the right chunk.
+    pub attachment: Option<OutboundAttachment>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -132,6 +165,16 @@ trait ChannelContract {
 
     async fn send_chunk(&self, target: &str, chunk: &OutboundChunk) -> Result<()>;
 
+    /// Delivers one reply attachment. Channels without attachment support
+    /// refuse rather than silently dropping it, so delivery stays durable and
+    /// retries instead of losing the file.
+    async fn send_attachment(&self, _target: &str, attachment: &OutboundAttachment) -> Result<()> {
+        bail!(
+            "channel does not support outbound attachments (would drop {:?})",
+            attachment.filename
+        )
+    }
+
     fn typing_refresh(&self) -> Option<Duration> {
         None
     }
@@ -143,6 +186,12 @@ trait ChannelContract {
     async fn download_voice(&self, voice: &InboundVoice) -> Result<AudioClip>;
     async fn send_voice(&self, target: &str, clip: &AudioClip) -> Result<()>;
     async fn download_image(&self, image: &InboundImage) -> Result<DownloadedImage>;
+
+    /// Downloads a non-image inbound attachment (PLAN §5). Channels without
+    /// file support refuse; the worker then reports a file fallback.
+    async fn download_file(&self, _file: &InboundFile) -> Result<DownloadedFile> {
+        bail!("this channel does not support inbound files")
+    }
 
     fn delivery_semantics(&self) -> DeliverySemantics {
         DeliverySemantics {
@@ -216,6 +265,7 @@ impl Channel {
                     .context("discord channel is missing its guild channel id")?
                     .to_string(),
                 cfg.discord_allow_channel_ids.clone(),
+                cfg.assistant_dir.clone(),
             )?)),
         }
     }
@@ -356,6 +406,28 @@ impl Channel {
         }
     }
 
+    #[cfg_attr(test, allow(dead_code))]
+    pub async fn send_attachment(
+        &self,
+        target: &str,
+        attachment: &OutboundAttachment,
+    ) -> Result<()> {
+        match self {
+            Self::IMessage(channel) => {
+                ChannelContract::send_attachment(channel, target, attachment).await
+            }
+            Self::Telegram(channel) => {
+                ChannelContract::send_attachment(channel, target, attachment).await
+            }
+            Self::Slack(channel) => {
+                ChannelContract::send_attachment(channel, target, attachment).await
+            }
+            Self::Discord(channel) => {
+                ChannelContract::send_attachment(channel, target, attachment).await
+            }
+        }
+    }
+
     pub fn typing_refresh(&self) -> Option<Duration> {
         match self {
             Self::IMessage(channel) => ChannelContract::typing_refresh(channel),
@@ -399,6 +471,15 @@ impl Channel {
             Self::Telegram(channel) => ChannelContract::download_image(channel, image).await,
             Self::Slack(channel) => ChannelContract::download_image(channel, image).await,
             Self::Discord(channel) => ChannelContract::download_image(channel, image).await,
+        }
+    }
+
+    pub async fn download_file(&self, file: &InboundFile) -> Result<DownloadedFile> {
+        match self {
+            Self::IMessage(channel) => ChannelContract::download_file(channel, file).await,
+            Self::Telegram(channel) => ChannelContract::download_file(channel, file).await,
+            Self::Slack(channel) => ChannelContract::download_file(channel, file).await,
+            Self::Discord(channel) => ChannelContract::download_file(channel, file).await,
         }
     }
 
@@ -473,6 +554,7 @@ impl ChannelContract for IMessageChannel {
                         data: None,
                     })
                     .collect(),
+                files: Vec::new(),
                 is_from_me: message.is_from_me,
                 is_supported: true,
                 thread_id: None,
@@ -570,6 +652,7 @@ impl ChannelContract for IMessageChannel {
             vec![OutboundChunk {
                 text: format!("{text}{marker}"),
                 rich_markdown: false,
+                attachment: None,
             }]
         }
     }
@@ -685,6 +768,7 @@ impl ChannelContract for Telegram {
             .map(|text| OutboundChunk {
                 text,
                 rich_markdown: true,
+                attachment: None,
             })
             .collect()
     }
@@ -791,6 +875,7 @@ impl ChannelContract for Slack {
             .map(|text| OutboundChunk {
                 text,
                 rich_markdown: true,
+                attachment: None,
             })
             .collect()
     }
@@ -905,18 +990,17 @@ impl ChannelContract for DiscordChannel {
     fn outbound_chunks(&self, text: &str, _marker: &str) -> Vec<OutboundChunk> {
         // Discord renders its own markdown flavour, so the agent's text is sent
         // unchanged: no marker (the bot and the human are separate authors), no
-        // HTML or mrkdwn conversion.
-        discord::discord_chunks(text)
-            .into_iter()
-            .map(|text| OutboundChunk {
-                text,
-                rich_markdown: true,
-            })
-            .collect()
+        // HTML or mrkdwn conversion. Reply `[send-file: …]` directives are
+        // turned into attachment chunks in source order (PLAN §5).
+        discord::discord_outbound_chunks(text, self.assistant_dir())
     }
 
     async fn send_chunk(&self, target: &str, chunk: &OutboundChunk) -> Result<()> {
         self.send_text(target, &chunk.text).await
+    }
+
+    async fn send_attachment(&self, target: &str, attachment: &OutboundAttachment) -> Result<()> {
+        self.send_attachment(target, attachment).await
     }
 
     async fn download_voice(&self, voice: &InboundVoice) -> Result<AudioClip> {
@@ -934,6 +1018,10 @@ impl ChannelContract for DiscordChannel {
 
     async fn download_image(&self, image: &InboundImage) -> Result<DownloadedImage> {
         self.download_image(image).await
+    }
+
+    async fn download_file(&self, file: &InboundFile) -> Result<DownloadedFile> {
+        self.download_file(file).await
     }
 
     fn delivery_semantics(&self) -> DeliverySemantics {
@@ -954,7 +1042,10 @@ fn common_reject_reason(message: &RawMessage) -> Option<&'static str> {
         Some("unsupported_update")
     } else if message.is_group {
         Some("group_chat")
-    } else if message.text.trim().is_empty() && message.voice.is_none() && message.images.is_empty()
+    } else if message.text.trim().is_empty()
+        && message.voice.is_none()
+        && message.images.is_empty()
+        && message.files.is_empty()
     {
         Some("empty_message")
     } else {
@@ -1059,6 +1150,7 @@ mod tests {
             text: "hello".to_string(),
             voice: None,
             images: Vec::new(),
+            files: Vec::new(),
             is_from_me,
             is_supported: true,
             thread_id: None,
@@ -1076,6 +1168,7 @@ mod tests {
             text: "hello".to_string(),
             voice: None,
             images: Vec::new(),
+            files: Vec::new(),
             is_from_me: false,
             is_supported: true,
             thread_id: None,
@@ -1120,6 +1213,7 @@ mod tests {
             [OutboundChunk {
                 text: format!("reply{REPLY_MARKER}"),
                 rich_markdown: false,
+                attachment: None,
             }]
         );
     }
@@ -1155,6 +1249,7 @@ mod tests {
             [OutboundChunk {
                 text: "reply".to_string(),
                 rich_markdown: true,
+                attachment: None,
             }]
         );
     }
@@ -1172,6 +1267,7 @@ mod tests {
             text: "hello".to_string(),
             voice: None,
             images: Vec::new(),
+            files: Vec::new(),
             is_from_me: false,
             is_supported: true,
             thread_id: None,
@@ -1336,6 +1432,7 @@ mod tests {
             text: "hey <@42> what is the time".to_string(),
             voice: None,
             images: Vec::new(),
+            files: Vec::new(),
             is_from_me: false,
             is_supported: true,
             thread_id: None,
