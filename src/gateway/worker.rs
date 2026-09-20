@@ -1383,12 +1383,12 @@ impl ApprovalHandler<'_> {
                 return UiResponse::Cancelled;
             }
         };
-        if let Err(error) = self
-            .ctx
-            .history
-            .lock()
-            .unwrap()
-            .create_question(&question, now)
+        if let Err(error) =
+            self.ctx
+                .history
+                .lock()
+                .unwrap()
+                .create_question(&question, Some(self.job.row_id), now)
         {
             warn!(
                 "[{}] could not persist approval question: {error}",

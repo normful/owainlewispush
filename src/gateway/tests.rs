@@ -1040,7 +1040,7 @@ async fn expired_answer_is_audited_without_reaching_the_backend() {
         .history
         .lock()
         .unwrap()
-        .create_question(&question, created_at)
+        .create_question(&question, None, created_at)
         .unwrap();
     tokio::time::sleep(Duration::from_millis(20)).await;
 
@@ -4043,7 +4043,7 @@ async fn retired_job_approval_reply_explains_direct_creation() {
     .unwrap();
     {
         let mut history = gateway.ctx.history.lock().unwrap();
-        history.create_question(&question, now_ms()).unwrap();
+        history.create_question(&question, None, now_ms()).unwrap();
         history.execute_batch_for_test(&format!(
             "INSERT INTO job_draft_proposals (
                 question_id, name, path, snapshot_hash, contents, proposed_by,

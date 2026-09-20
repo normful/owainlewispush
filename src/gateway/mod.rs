@@ -273,6 +273,29 @@ impl GatewayGroup {
                 );
                 continue;
             }
+            // Do not replay the abandoned run: advance the channel cursor past
+            // its inbound row (and record it completed) so the parked trigger is
+            // not re-polled and re-executed. Rows after it are still processed.
+            if let Some(run_row_id) = question.run_row_id {
+                let key = gateway.channel.store_key();
+                let completed = gateway
+                    .ctx
+                    .store
+                    .lock()
+                    .unwrap()
+                    .mark_row_completed(&key, run_row_id);
+                let advanced = gateway
+                    .ctx
+                    .store
+                    .lock()
+                    .unwrap()
+                    .set_cursor(&key, run_row_id);
+                if let Err(error) = completed.and(advanced) {
+                    warn!(
+                        "could not guard abandoned approval run row {run_row_id} on {key}: {error:#}"
+                    );
+                }
+            }
             let notice = "The assistant restarted before that request was approved, so it was cancelled. Ask again if you still want it.";
             if !reply_to(&gateway.ctx, &question.target, notice).await {
                 warn!(
@@ -575,7 +598,7 @@ impl Gateway {
             .history
             .lock()
             .unwrap()
-            .create_question(&question, now_ms())?;
+            .create_question(&question, None, now_ms())?;
         let delivered = reply_to(&self.ctx, &question.target, &question.render_text()).await;
         self.ctx.history.lock().unwrap().mark_question_delivery(
             &id,

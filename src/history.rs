@@ -13,7 +13,7 @@ use crate::approval::{
     NormalizedAnswer, Question,
 };
 
-const SCHEMA_VERSION: i64 = 14;
+const SCHEMA_VERSION: i64 = 15;
 const RETIRED_JOB_APPROVAL_ERROR: &str = "job approval was removed; request direct job creation";
 
 /// A pending approval question, used for startup recovery (DESIGN §4).
@@ -23,6 +23,9 @@ pub struct PendingQuestion {
     pub channel: String,
     pub thread_key: String,
     pub target: String,
+    /// The inbound row whose parked run asked this question. Used to keep that
+    /// row from being replayed after a restart.
+    pub run_row_id: Option<i64>,
 }
 
 const MAX_HISTORY_READ_BYTES: usize = 8 * 1024;
@@ -343,7 +346,14 @@ impl History {
         Ok(messages)
     }
 
-    pub fn create_question(&mut self, question: &Question, now_ms: i64) -> Result<()> {
+    /// Persists a question. `run_row_id` is the inbound row whose parked run
+    /// asked it, so a restart can keep that row from being replayed.
+    pub fn create_question(
+        &mut self,
+        question: &Question,
+        run_row_id: Option<i64>,
+        now_ms: i64,
+    ) -> Result<()> {
         question.validate()?;
         if question.expires_at_ms <= now_ms {
             bail!("approval question expiry must be in the future");
@@ -352,8 +362,8 @@ impl History {
         self.conn.execute(
             "INSERT INTO approval_questions (
                 id, channel, thread_key, sender_key, chat_key, target,
-                prompt, choices_json, expires_at_ms, status, delivery_status
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'pending', 'pending')",
+                prompt, choices_json, expires_at_ms, status, delivery_status, run_row_id
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'pending', 'pending', ?10)",
             params![
                 question.id,
                 question.channel,
@@ -364,6 +374,7 @@ impl History {
                 question.prompt,
                 choices,
                 question.expires_at_ms,
+                run_row_id,
             ],
         )?;
         Ok(())
@@ -599,7 +610,7 @@ impl History {
     /// Every still-pending approval question, for startup recovery (DESIGN §4).
     pub fn pending_questions(&self) -> Result<Vec<PendingQuestion>> {
         let mut statement = self.conn.prepare(
-            "SELECT id, channel, thread_key, target FROM approval_questions
+            "SELECT id, channel, thread_key, target, run_row_id FROM approval_questions
              WHERE status = 'pending'",
         )?;
         let rows = statement.query_map([], |row| {
@@ -608,6 +619,7 @@ impl History {
                 channel: row.get(1)?,
                 thread_key: row.get(2)?,
                 target: row.get(3)?,
+                run_row_id: row.get(4)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -990,8 +1002,28 @@ fn migrate(conn: &Connection) -> Result<()> {
              PRAGMA user_version = 14;",
         )?;
     }
+    if version <= 14 {
+        // Idempotent: test fixtures and re-opened databases may already carry
+        // the column even at an older `user_version`.
+        if !column_exists(conn, "approval_questions", "run_row_id")? {
+            conn.execute_batch("ALTER TABLE approval_questions ADD COLUMN run_row_id INTEGER;")?;
+        }
+        conn.execute_batch("PRAGMA user_version = 15;")?;
+    }
     conn.execute_batch("COMMIT;")?;
     Ok(())
+}
+
+fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+    let mut statement = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let mut rows = statement.query([])?;
+    while let Some(row) = rows.next()? {
+        let name: String = row.get(1)?;
+        if name == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn conversation(tx: &Transaction<'_>, channel: &str, thread_key: &str) -> Result<i64> {
@@ -1119,7 +1151,7 @@ mod tests {
         let path = temp_path("retired-job-approval-migration");
         let mut history = History::open(path.to_str().unwrap()).unwrap();
         let question = question(i64::MAX);
-        history.create_question(&question, 1_000).unwrap();
+        history.create_question(&question, None, 1_000).unwrap();
         history
             .conn
             .execute(
@@ -1249,7 +1281,7 @@ mod tests {
         );
         assert!(reopened.outbound_for(inbound).unwrap().is_none());
         let question = question(2_000);
-        reopened.create_question(&question, 1_000).unwrap();
+        reopened.create_question(&question, None, 1_000).unwrap();
         let _ = std::fs::remove_file(path);
     }
 
@@ -1258,7 +1290,7 @@ mod tests {
         let path = temp_path("jobs-v2-migration");
         let mut history = History::open(path.to_str().unwrap()).unwrap();
         let question = question(2_000);
-        history.create_question(&question, 1_000).unwrap();
+        history.create_question(&question, None, 1_000).unwrap();
         history.execute_batch_for_test(
             "DROP TABLE gateway_control_actions;
              DROP TABLE job_draft_proposals;
@@ -1364,7 +1396,7 @@ mod tests {
         let path = temp_path("approval-restart");
         let mut history = History::open(path.to_str().unwrap()).unwrap();
         let question = question(2_000);
-        history.create_question(&question, 1_000).unwrap();
+        history.create_question(&question, None, 1_000).unwrap();
         drop(history);
 
         let mut reopened = History::open(path.to_str().unwrap()).unwrap();
@@ -1400,8 +1432,8 @@ mod tests {
         let mut history = History::open(path.to_str().unwrap()).unwrap();
         let first = question(20_000);
         let second = question(20_000);
-        history.create_question(&first, 1_000).unwrap();
-        history.create_question(&second, 1_000).unwrap();
+        history.create_question(&first, Some(99), 1_000).unwrap();
+        history.create_question(&second, None, 1_000).unwrap();
 
         let pending = history.pending_questions().unwrap();
         assert_eq!(pending.len(), 2);
@@ -1409,6 +1441,7 @@ mod tests {
         assert_eq!(listed.channel, "telegram");
         assert_eq!(listed.thread_key, "telegram:dm:7:topic:9");
         assert_eq!(listed.target, "7:9");
+        assert_eq!(listed.run_row_id, Some(99));
 
         assert!(history.cancel_question(&first.id, 1_100).unwrap());
         let pending = history.pending_questions().unwrap();
@@ -1418,11 +1451,26 @@ mod tests {
     }
 
     #[test]
+    fn pending_question_run_row_id_survives_reopen() {
+        let path = temp_path("approval-run-row");
+        let mut history = History::open(path.to_str().unwrap()).unwrap();
+        let q = question(20_000);
+        history.create_question(&q, Some(777), 1_000).unwrap();
+        drop(history);
+
+        let reopened = History::open(path.to_str().unwrap()).unwrap();
+        let pending = reopened.pending_questions().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].run_row_id, Some(777));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn question_rejects_mismatch_expiry_invalid_choice_and_cancellation() {
         let path = temp_path("approval-rejections");
         let mut history = History::open(path.to_str().unwrap()).unwrap();
         let expired = question(2_000);
-        history.create_question(&expired, 1_000).unwrap();
+        history.create_question(&expired, None, 1_000).unwrap();
         let mut wrong_topic = origin();
         wrong_topic.thread_key = "telegram:dm:7".to_string();
         assert_eq!(
@@ -1449,7 +1497,7 @@ mod tests {
         );
 
         let cancelled = question(4_000);
-        history.create_question(&cancelled, 2_100).unwrap();
+        history.create_question(&cancelled, None, 2_100).unwrap();
         assert!(history.cancel_question(&cancelled.id, 2_200).unwrap());
         assert!(!history.cancel_question(&cancelled.id, 2_300).unwrap());
         assert_eq!(
@@ -1464,7 +1512,7 @@ mod tests {
         );
 
         let timed_out = question(3_000);
-        history.create_question(&timed_out, 2_600).unwrap();
+        history.create_question(&timed_out, None, 2_600).unwrap();
         assert!(!history.cancel_question(&timed_out.id, 3_100).unwrap());
         assert_eq!(
             history.question_state(&timed_out.id, 3_100).unwrap(),
@@ -1472,9 +1520,9 @@ mod tests {
         );
 
         let stale = question(4_000);
-        history.create_question(&stale, 3_200).unwrap();
+        history.create_question(&stale, None, 3_200).unwrap();
         let live = question(6_000);
-        history.create_question(&live, 3_300).unwrap();
+        history.create_question(&live, None, 3_300).unwrap();
         assert_eq!(
             history.answer_question(&origin(), "1", 5_000).unwrap(),
             AnswerOutcome::Selected(NormalizedAnswer {
