@@ -28,7 +28,7 @@ use std::time::{Duration, Instant};
 
 use crate::agent::{final_reply, RunError, RunOutput};
 
-use super::rpc::{Session, UiRequest, UiResponse};
+use super::rpc::{Session, UiHandler};
 
 /// Static limits for a pool, resolved once from `[agent]` config.
 #[derive(Debug, Clone, Copy)]
@@ -68,6 +68,9 @@ pub struct PiRpcSpec {
     pub images: Vec<PathBuf>,
     /// Extra environment for the child (gate tool list, …).
     pub env: Vec<(String, String)>,
+    /// Absolute path to the approval gate extension, loaded with `-e` when set
+    /// (DESIGN §6). `None` spawns an ungated child.
+    pub extension: Option<PathBuf>,
 }
 
 struct Entry {
@@ -98,17 +101,14 @@ impl Pool {
     /// Runs one turn on `key`'s thread, spawning and initializing a child on
     /// first use. `key` is the channel-qualified thread push already uses for
     /// serialization (`job.thread`).
-    pub async fn run<F>(
+    pub async fn run(
         &self,
         key: &str,
         spec: PiRpcSpec,
         prompt: &str,
         timeout: Duration,
-        on_ui: F,
-    ) -> Result<RunOutput, RunError>
-    where
-        F: FnMut(&UiRequest) -> UiResponse,
-    {
+        handler: &mut dyn UiHandler,
+    ) -> Result<RunOutput, RunError> {
         let (mut session, session_id) = self.acquire(key, &spec, timeout).await?;
         // The guard forgets this thread's entry if the run future is dropped
         // (interrupt/task abort) before the turn settles.
@@ -118,7 +118,7 @@ impl Pool {
             armed: true,
         };
 
-        let outcome = match session.turn(prompt, timeout, on_ui).await {
+        let outcome = match session.turn(prompt, timeout, handler).await {
             Ok(outcome) => outcome,
             Err(error) => {
                 guard.armed = false;
@@ -252,6 +252,12 @@ impl Pool {
         for image in &spec.images {
             args.push(format!("@{}", image.display()));
         }
+        // The approval gate is an explicit `-e` path (DESIGN §6). It is only
+        // loaded when configured, so an ungated child never prompts.
+        if let Some(extension) = &spec.extension {
+            args.push("-e".to_string());
+            args.push(extension.to_string_lossy().to_string());
+        }
         Session::spawn(&spec.bin, &args, &spec.env, &spec.work_dir)
             .map_err(|error| RunError::Failed(format!("spawn pi rpc: {error:#}")))
     }
@@ -380,6 +386,7 @@ fn classify(error: anyhow::Error) -> RunError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pi::rpc::CancelHandler;
     use crate::test_support::{sh_arg, temp_path, FakeCli};
     use std::sync::Arc;
 
@@ -420,6 +427,7 @@ done
             thinking: None,
             images: Vec::new(),
             env: Vec::new(),
+            extension: None,
         }
     }
 
@@ -442,7 +450,7 @@ done
                 spec(&cli.bin(), true, "", dir),
                 "one",
                 Duration::from_secs(5),
-                |_| UiResponse::Cancelled,
+                &mut CancelHandler,
             )
             .await
             .unwrap();
@@ -452,7 +460,7 @@ done
                 spec(&cli.bin(), false, "sess-1", dir),
                 "two",
                 Duration::from_secs(5),
-                |_| UiResponse::Cancelled,
+                &mut CancelHandler,
             )
             .await
             .unwrap();
@@ -482,7 +490,7 @@ done
             spec(&cli.bin(), true, "", dir),
             "one",
             Duration::from_secs(5),
-            |_| UiResponse::Cancelled,
+            &mut CancelHandler,
         )
         .await
         .unwrap();
@@ -511,7 +519,7 @@ done
             spec(&bin, true, "", &dir),
             "one",
             Duration::from_secs(5),
-            |_| UiResponse::Cancelled,
+            &mut CancelHandler,
         )
         .await
         .unwrap();
@@ -528,7 +536,7 @@ done
                     spec(&bin, false, "sess-1", &dir),
                     "two",
                     Duration::from_secs(5),
-                    |_| UiResponse::Cancelled,
+                    &mut CancelHandler,
                 )
                 .await
             })
@@ -559,7 +567,7 @@ done
                 spec(&cli.bin(), true, "", dir),
                 "hello",
                 Duration::from_secs(5),
-                |_| UiResponse::Cancelled,
+                &mut CancelHandler,
             )
             .await
             .unwrap();
@@ -571,7 +579,7 @@ done
             spec(&cli.bin(), true, "", dir),
             "hello",
             Duration::from_secs(5),
-            |_| UiResponse::Cancelled,
+            &mut CancelHandler,
         )
         .await
         .unwrap();
@@ -596,7 +604,7 @@ done
                 spec(&cli.bin(), false, "gone", work_dir.to_str().unwrap()),
                 "one",
                 Duration::from_secs(5),
-                |_| UiResponse::Cancelled,
+                &mut CancelHandler,
             )
             .await
             .unwrap_err();

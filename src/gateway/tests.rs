@@ -4067,6 +4067,153 @@ async fn run_pi_path(mode: &str, script: fn(&Path) -> String) -> PiPathResult {
     (replies, session, messages, spawns)
 }
 
+/// The fake rpc `pi` behind an approval run: it emits a gated `select` on every
+/// prompt and settles once the host answers the dialog.
+fn fake_rpc_approval_pi(marker: &Path) -> String {
+    format!(
+        r#"#!/bin/sh
+printf 'x' >> {marker}
+while IFS= read -r line; do
+  case "$line" in
+    *"get_state"*)
+      printf '%s\n' '{{"type":"response","command":"get_state","id":"push-state","data":{{"sessionId":"fake-session","model":{{"id":"m"}},"thinkingLevel":"high"}}}}'
+      ;;
+    *"get_last_assistant_text"*)
+      printf '%s\n' '{{"type":"response","command":"get_last_assistant_text","id":"push-final","data":{{"text":"approved reply"}}}}'
+      ;;
+    *'"type":"prompt"'*)
+      printf '%s\n' '{{"type":"extension_ui_request","id":"ui-1","method":"select","title":"Approve bash?","options":["1. Allow","2. Deny"]}}'
+      ;;
+    *"extension_ui_response"*)
+      printf '%s\n' '{{"type":"tool_execution_end","toolName":"bash","isError":false,"result":{{"content":[{{"type":"text","text":"ran"}}]}}}}'
+      printf '%s\n' '{{"type":"agent_settled"}}'
+      ;;
+  esac
+done
+"#,
+        marker = sh_arg(marker),
+    )
+}
+
+/// Builds a `pi_mode = "rpc"` gateway whose rpc child gates `bash`. The
+/// [`FakeCli`] is returned so the caller keeps the executable alive.
+fn rpc_approval_gateway(name: &str, marker: &Path) -> (Gateway, String, FakeCli) {
+    let state_path = temp_state_path();
+    let assistant_dir = temp_path(&format!("{name}-assistant"));
+    std::fs::create_dir_all(assistant_dir.join("context")).unwrap();
+    std::fs::create_dir_all(assistant_dir.join("jobs")).unwrap();
+    std::fs::write(assistant_dir.join("SOUL.md"), "Be useful.\n").unwrap();
+    let cli = FakeCli::new(name, &fake_rpc_approval_pi(marker));
+    let mut cfg = test_config(&state_path, &state_path, assistant_dir.to_str().unwrap());
+    cfg.agent = "pi".to_string();
+    cfg.pi_mode = "rpc".to_string();
+    cfg.agent_commands.pi = cli.bin();
+    cfg.approval_gated_tools = vec!["bash".to_string()];
+    cfg.approval_gate_extension = Some(format!(
+        "{}/extensions/tool_gate.ts",
+        env!("CARGO_MANIFEST_DIR")
+    ));
+    cfg.approval_timeout = "5s".to_string();
+    (Gateway::new(cfg).unwrap(), state_path, cli)
+}
+
+/// Waits (bounded) until a delivered reply satisfies `predicate`.
+async fn wait_for_reply(gateway: &Gateway, predicate: impl Fn(&str) -> bool + Send) -> String {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let found = gateway
+            .ctx
+            .sent_replies
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, text)| text.clone())
+            .find(|text| predicate(text));
+        if let Some(text) = found {
+            return text;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for a delivered reply; delivered={:?} setup_failures={:?}",
+            gateway.ctx.sent_replies.lock().unwrap(),
+            gateway.ctx.setup_failure_replies.lock().unwrap(),
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Extracts the correlation UUID from a rendered question.
+fn correlation_id(text: &str) -> String {
+    text.split_whitespace()
+        .map(|token| token.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '-'))
+        .find_map(|token| uuid::Uuid::parse_str(token).ok().map(|id| id.to_string()))
+        .expect("question should carry a correlation id")
+}
+
+/// PLAN §7 step 3 verification: a gated rpc tool call asks in chat and the run
+/// resumes once the user answers the numbered question.
+#[tokio::test]
+async fn rpc_mode_approval_round_trip_resumes_after_a_numbered_answer() {
+    let marker = temp_path("rpc-approval-marker");
+    let (mut gateway, _state, _cli) = rpc_approval_gateway("pi-rpc-approval", &marker);
+
+    gateway
+        .tick_fake(vec![message(
+            1,
+            "+15551234567",
+            "+15551234567",
+            false,
+            "run bash",
+        )])
+        .await;
+
+    let question = wait_for_reply(&gateway, |text| text.contains("Reply with `")).await;
+    assert!(question.contains("Approve bash?"));
+    assert!(question.contains("1. 1. Allow") || question.contains("1. Allow"));
+    let id = correlation_id(&question);
+
+    gateway
+        .tick_fake(vec![message(
+            2,
+            "+15551234567",
+            "+15551234567",
+            false,
+            &format!("{id} 1"),
+        )])
+        .await;
+
+    let reply = wait_for_reply(&gateway, |text| text.contains("approved reply")).await;
+    assert!(reply.contains("approved reply"));
+
+    gateway.queues.clear();
+    gateway.drain_workers().await;
+}
+
+/// A question nobody answers does not wedge the run: push owns the deadline and
+/// cancels the dialog, so the turn still settles.
+#[tokio::test]
+async fn rpc_mode_approval_times_out_without_hanging_the_run() {
+    let marker = temp_path("rpc-approval-timeout-marker");
+    let (mut gateway, _state, _cli) = rpc_approval_gateway("pi-rpc-approval-timeout", &marker);
+    gateway.ctx.cfg.approval_timeout = "300ms".to_string();
+
+    gateway
+        .tick_fake(vec![message(
+            1,
+            "+15551234567",
+            "+15551234567",
+            false,
+            "run bash",
+        )])
+        .await;
+
+    let reply = wait_for_reply(&gateway, |text| text.contains("approved reply")).await;
+    assert!(reply.contains("approved reply"));
+
+    gateway.queues.clear();
+    gateway.drain_workers().await;
+}
+
 /// PLAN §7 step 2 verification: with `pi_mode = "rpc"` one child serves two
 /// turns on one thread, and the canonical rows match the unchanged print path.
 #[tokio::test]
@@ -4136,6 +4283,9 @@ fn test_config(state_path: &str, _sessions_dir: &str, assistant_dir: &str) -> Co
         pi_mode: "print".to_string(),
         rpc_pool_max: 12,
         rpc_idle_timeout: "10m".to_string(),
+        approval_gated_tools: Vec::new(),
+        approval_timeout: "10m".to_string(),
+        approval_gate_extension: None,
         routes: Vec::new(),
         assistant_root: assistant_dir.to_string(),
         jobs_dir: format!("{state_path}.jobs"),

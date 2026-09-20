@@ -25,7 +25,9 @@
 //! `get_last_assistant_text` rather than reassembled from the stream.
 
 use std::collections::VecDeque;
+use std::future::Future;
 use std::io;
+use std::pin::Pin;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -92,6 +94,41 @@ impl UiResponse {
                 json!({"type": "extension_ui_response", "id": id, "cancelled": true})
             }
         }
+    }
+}
+
+/// A handler's answer to one [`UiRequest`], boxed so [`Session::turn`] can park
+/// on a human reply without knowing the handler's concrete type.
+pub type UiFuture<'a> = Pin<Box<dyn Future<Output = UiResponse> + Send + 'a>>;
+
+/// Answers the child's extension-UI requests. Async because a real approval
+/// must *park* the turn until the human replies (DESIGN §2); a `FnMut` closure
+/// cannot express that, hence the boxed-future trait object.
+pub trait UiHandler: Send {
+    fn handle<'a>(&'a mut self, request: &'a UiRequest) -> UiFuture<'a>;
+}
+
+/// Adapts a synchronous closure to [`UiHandler`] for tests and callers that
+/// never wait on a human.
+pub struct FnHandler<F>(pub F);
+
+impl<F> UiHandler for FnHandler<F>
+where
+    F: FnMut(&UiRequest) -> UiResponse + Send,
+{
+    fn handle<'a>(&'a mut self, request: &'a UiRequest) -> UiFuture<'a> {
+        let response = (self.0)(request);
+        Box::pin(async move { response })
+    }
+}
+
+/// Answers every dialog as cancelled. Used when the approval gate is off, so an
+/// unexpected UI request can never block an ungated run.
+pub struct CancelHandler;
+
+impl UiHandler for CancelHandler {
+    fn handle<'a>(&'a mut self, _request: &'a UiRequest) -> UiFuture<'a> {
+        Box::pin(async { UiResponse::Cancelled })
     }
 }
 
@@ -234,17 +271,14 @@ impl Session {
     }
 
     /// Runs one prompt to completion, answering extension-UI requests through
-    /// `on_ui`. The final text comes from `get_last_assistant_text` after
+    /// `handler`. The final text comes from `get_last_assistant_text` after
     /// `agent_settled`; an empty tool-call turn is never mistaken for an answer.
-    pub async fn turn<F>(
+    pub async fn turn(
         &mut self,
         prompt: &str,
         timeout: Duration,
-        mut on_ui: F,
-    ) -> Result<TurnOutcome>
-    where
-        F: FnMut(&UiRequest) -> UiResponse,
-    {
+        handler: &mut dyn UiHandler,
+    ) -> Result<TurnOutcome> {
         self.send(&json!({"type": "prompt", "message": prompt}))
             .await?;
         let mut skipped = 0usize;
@@ -334,7 +368,7 @@ impl Session {
                             UiRequest::Other { id, method }
                         }
                     };
-                    let response = on_ui(&request);
+                    let response = handler.handle(&request).await;
                     ui_requests.push(request.clone());
                     self.send(&response.wire(request.id())).await?;
                 }
@@ -425,6 +459,17 @@ impl UiQueue {
     }
 }
 
+/// A [`UiHandler`] over a prepared [`UiQueue`], for tests that stage a fixed
+/// sequence of answers.
+pub struct QueueHandler(pub UiQueue);
+
+impl UiHandler for QueueHandler {
+    fn handle<'a>(&'a mut self, request: &'a UiRequest) -> UiFuture<'a> {
+        let response = self.0.pop(request);
+        Box::pin(async move { response })
+    }
+}
+
 /// Best-effort child termination without a graceful attempt; used on drop paths.
 pub fn terminate(child: &mut Child) -> io::Result<()> {
     child.start_kill()
@@ -499,16 +544,17 @@ done
 
         let seen = Arc::new(Mutex::new(Vec::new()));
         let seen_handle = seen.clone();
-        let outcome = session
-            .turn("do the thing", Duration::from_secs(5), move |request| {
-                seen_handle.lock().unwrap().push(request.clone());
-                match request {
-                    UiRequest::Select { options, .. } => {
-                        UiResponse::Select(options.first().cloned().unwrap_or_default())
-                    }
-                    _ => UiResponse::Cancelled,
+        let mut handler = FnHandler(move |request: &UiRequest| {
+            seen_handle.lock().unwrap().push(request.clone());
+            match request {
+                UiRequest::Select { options, .. } => {
+                    UiResponse::Select(options.first().cloned().unwrap_or_default())
                 }
-            })
+                _ => UiResponse::Cancelled,
+            }
+        });
+        let outcome = session
+            .turn("do the thing", Duration::from_secs(5), &mut handler)
             .await
             .unwrap();
 
@@ -536,8 +582,9 @@ done
         )
         .unwrap();
         session.init(Duration::from_secs(5)).await.unwrap();
+        let mut handler = CancelHandler;
         let outcome = session
-            .turn("go", Duration::from_secs(5), |_| UiResponse::Cancelled)
+            .turn("go", Duration::from_secs(5), &mut handler)
             .await
             .unwrap();
         assert_eq!(outcome.text, "hello from gate");
@@ -564,5 +611,20 @@ done
             title: "t".to_string(),
         };
         assert_eq!(queue.pop(&confirm), UiResponse::Confirm(false));
+    }
+
+    #[tokio::test]
+    async fn queue_handler_adapts_the_queue_to_the_trait() {
+        let mut handler = QueueHandler(UiQueue::default());
+        let select = UiRequest::Select {
+            id: "a".to_string(),
+            title: "t".to_string(),
+            options: vec!["1. Allow".to_string(), "2. Deny".to_string()],
+        };
+        assert_eq!(
+            handler.handle(&select).await,
+            UiResponse::Cancelled,
+            "an exhausted queue cancels a select"
+        );
     }
 }

@@ -6,9 +6,12 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 
-use crate::approval::{parse_answer, AnswerOrigin, AnswerOutcome, NormalizedAnswer};
 #[cfg(test)]
-use crate::approval::{DeliveryStatus as ApprovalDeliveryStatus, Question, QuestionState};
+use crate::approval::QuestionState;
+use crate::approval::{
+    parse_answer, AnswerOrigin, AnswerOutcome, DeliveryStatus as ApprovalDeliveryStatus,
+    NormalizedAnswer, Question,
+};
 
 const SCHEMA_VERSION: i64 = 14;
 const RETIRED_JOB_APPROVAL_ERROR: &str = "job approval was removed; request direct job creation";
@@ -330,7 +333,6 @@ impl History {
         Ok(messages)
     }
 
-    #[cfg(test)]
     pub fn create_question(&mut self, question: &Question, now_ms: i64) -> Result<()> {
         question.validate()?;
         if question.expires_at_ms <= now_ms {
@@ -357,7 +359,6 @@ impl History {
         Ok(())
     }
 
-    #[cfg(test)]
     pub fn mark_question_delivery(
         &mut self,
         id: &str,
@@ -530,7 +531,6 @@ impl History {
             .is_some())
     }
 
-    #[cfg(test)]
     pub fn take_answer(&mut self, id: &str, now_ms: i64) -> Result<Option<NormalizedAnswer>> {
         let tx = self.conn.transaction()?;
         tx.execute(
@@ -586,7 +586,6 @@ impl History {
             .transpose()
     }
 
-    #[cfg(test)]
     pub fn cancel_question(&mut self, id: &str, now_ms: i64) -> Result<bool> {
         let tx = self.conn.transaction()?;
         tx.execute(

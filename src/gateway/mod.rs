@@ -878,6 +878,21 @@ impl Gateway {
                         self.complete_row(m.row_id, "approval_answer");
                         continue;
                     }
+                    Ok(
+                        outcome @ (AnswerOutcome::Ambiguous
+                        | AnswerOutcome::Mismatched(_)
+                        | AnswerOutcome::InvalidChoice(_)),
+                    ) => {
+                        // A stray or malformed numeric reply must not become a
+                        // chat message (DESIGN §2/§8.7). Acknowledge and stop.
+                        self.audit_approval(m.row_id, &thread, &outcome);
+                        let notice = "I could not match that number to a question. Reply with the exact `<id> <number>` shown with the question.";
+                        if !reply_to(&self.ctx, &target, notice).await {
+                            warn!("[{thread}] unmatched approval notice delivery failed");
+                        }
+                        self.complete_row(m.row_id, "approval_answer_unmatched");
+                        continue;
+                    }
                     Ok(outcome) => {
                         let retired_job_approval = match &outcome {
                             AnswerOutcome::Cancelled(id) => self

@@ -90,6 +90,7 @@ fn run_checks(cfg: &config::Config) -> CheckReport {
     check_scheduled_delivery(cfg, &mut checks);
     check_bins(cfg, &mut checks);
     check_voice(cfg, &mut checks);
+    check_approval(cfg, &mut checks);
     CheckReport { checks }
 }
 
@@ -199,6 +200,32 @@ fn check_voice(cfg: &config::Config, checks: &mut Vec<Check>) {
             crate::voice::TRANSCRIPTION_MODEL
         ),
     ));
+}
+
+/// Reports the approval gate (PLAN §7). Only meaningful under `pi_mode = "rpc"`.
+fn check_approval(cfg: &config::Config, checks: &mut Vec<Check>) {
+    if !cfg.approval_gate_enabled() {
+        checks.push(Check::pass(
+            "approvals",
+            "no gated tools configured; rpc runs never prompt",
+        ));
+        return;
+    }
+    let tools = cfg.approval_gated_tools.join(", ");
+    if cfg.pi_rpc_enabled() {
+        checks.push(Check::pass(
+            "approvals",
+            format!("pi_mode=rpc gates {tools} behind the approval gate"),
+        ));
+    } else {
+        checks.push(Check::fail(
+            "approvals",
+            format!(
+                "approval_gated_tools is set ({tools}) but pi_mode is {:?}; approvals need pi_mode = \"rpc\"",
+                cfg.pi_mode
+            ),
+        ));
+    }
 }
 
 fn check_secret_config_permissions(cfg: &config::Config, checks: &mut Vec<Check>) {
@@ -543,6 +570,24 @@ mod tests {
         assert!(matches!(checks[0].status, CheckStatus::Pass));
         assert!(checks[0].message.contains("Gemini"));
         assert!(checks[0].message.contains("no key on the VM"));
+    }
+
+    #[test]
+    fn approval_check_requires_rpc_mode_when_tools_are_gated() {
+        let mut cfg = test_config();
+        cfg.approval_gated_tools = vec!["bash".to_string()];
+        cfg.approval_gate_extension = Some("/tmp/tool_gate.ts".to_string());
+
+        let mut checks = Vec::new();
+        check_approval(&cfg, &mut checks);
+        assert!(matches!(checks[0].status, CheckStatus::Fail));
+        assert!(checks[0].message.contains("pi_mode"));
+
+        cfg.pi_mode = "rpc".to_string();
+        checks.clear();
+        check_approval(&cfg, &mut checks);
+        assert!(matches!(checks[0].status, CheckStatus::Pass));
+        assert!(checks[0].message.contains("bash"));
     }
 
     #[cfg(unix)]

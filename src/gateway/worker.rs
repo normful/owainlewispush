@@ -11,10 +11,13 @@ use tokio::sync::{mpsc, watch};
 use tracing::{error, info, warn};
 
 use crate::agent::{Request, RunError, RunOutput, Runner};
+use crate::approval::{Choice, Question};
 use crate::attachments::{DownloadedFile, PreparedFiles, MAX_FILE_BYTES, MAX_FILE_COUNT};
 use crate::history::{DeliveryStatus, OutboundMessage, OutboundOrigin};
 use crate::image::{PreparedImages, MAX_IMAGE_BYTES, MAX_IMAGE_COUNT};
+use crate::pi::rpc::{UiFuture, UiHandler, UiRequest, UiResponse};
 use crate::prompt::{ComposedPrompt, Composer};
+use crate::util::now_ms;
 use crate::voice::MAX_AUDIO_BYTES;
 
 use super::{audit, audit_schedule_events, complete_row, Ctx, Job, WorkerState};
@@ -1269,9 +1272,25 @@ async fn dispatch(
         model: job.model.clone(),
         thinking: job.thinking.clone(),
         images: attachment_paths.to_vec(),
-        // Step 3 wires the approval gate's `GATE_TOOLS` here; step 2 ships the
-        // pool with no gate so the rpc path cannot prompt unexpectedly.
-        env: Vec::new(),
+        // The gate only loads when tools are configured; an ungated rpc child
+        // can never prompt unexpectedly (PLAN §7).
+        env: if ctx.cfg.approval_gate_enabled() {
+            vec![(
+                "GATE_TOOLS".to_string(),
+                ctx.cfg.approval_gated_tools.join(","),
+            )]
+        } else {
+            Vec::new()
+        },
+        extension: ctx.cfg.approval_gate_extension_path(),
+    };
+    let mut handler = ApprovalHandler {
+        ctx,
+        job,
+        timeout: ctx
+            .cfg
+            .approval_timeout_dur()
+            .unwrap_or_else(|_| Duration::from_secs(600)),
     };
     ctx.pool
         .run(
@@ -1279,7 +1298,152 @@ async fn dispatch(
             spec,
             &prompt.content,
             ctx.run_timeout,
-            |_request| crate::pi::rpc::UiResponse::Cancelled,
+            &mut handler,
         )
         .await
+}
+
+/// Translates a child's extension-UI request into push's durable question flow
+/// and parks the run until the user answers (PLAN §7 / DESIGN §2).
+///
+/// It borrows the worker's `Ctx` and `Job`: creating the question, delivering
+/// it, and polling `take_answer` are all short-lived operations that must not
+/// hold the history lock across an await.
+struct ApprovalHandler<'a> {
+    ctx: &'a Ctx,
+    job: &'a Job,
+    timeout: Duration,
+}
+
+impl UiHandler for ApprovalHandler<'_> {
+    fn handle<'a>(&'a mut self, request: &'a UiRequest) -> UiFuture<'a> {
+        Box::pin(async move { self.ask(request).await })
+    }
+}
+
+impl ApprovalHandler<'_> {
+    async fn ask(&mut self, request: &UiRequest) -> UiResponse {
+        let (prompt, choices, confirm) = match request {
+            UiRequest::Select { title, options, .. } => {
+                // A `select` carries the option strings verbatim; the value is
+                // the string itself so push can map the number back without
+                // guessing.
+                let choices = options
+                    .iter()
+                    .map(|option| Choice {
+                        label: option.clone(),
+                        value: option.clone(),
+                    })
+                    .collect::<Vec<_>>();
+                if !(2..=crate::approval::MAX_CHOICES).contains(&choices.len()) {
+                    warn!(
+                        "[{}] approval select had {} options; cancelling",
+                        self.job.thread,
+                        choices.len()
+                    );
+                    return UiResponse::Cancelled;
+                }
+                (title.clone(), choices, false)
+            }
+            UiRequest::Confirm { title, .. } => (
+                title.clone(),
+                vec![
+                    Choice {
+                        label: "Allow".to_string(),
+                        value: "allow".to_string(),
+                    },
+                    Choice {
+                        label: "Deny".to_string(),
+                        value: "deny".to_string(),
+                    },
+                ],
+                true,
+            ),
+            // `input`/`editor`/fire-and-forget methods: push has no UI for them,
+            // and the spike confirms replying is protocol noise. Cancel.
+            UiRequest::Other { .. } => return UiResponse::Cancelled,
+        };
+
+        let now = now_ms();
+        let expiry = now.saturating_add(self.timeout.as_millis() as i64);
+        let question = match Question::new(
+            self.job.approval_origin.clone(),
+            self.job.target.clone(),
+            prompt,
+            choices,
+            expiry,
+        ) {
+            Ok(question) => question,
+            Err(error) => {
+                warn!(
+                    "[{}] could not build approval question: {error}",
+                    self.job.thread
+                );
+                return UiResponse::Cancelled;
+            }
+        };
+        if let Err(error) = self
+            .ctx
+            .history
+            .lock()
+            .unwrap()
+            .create_question(&question, now)
+        {
+            warn!(
+                "[{}] could not persist approval question: {error}",
+                self.job.thread
+            );
+            return UiResponse::Cancelled;
+        }
+
+        let text = question.render_correlated_text();
+        if !super::reply_to(self.ctx, &self.job.target, &text).await {
+            let _ = self
+                .ctx
+                .history
+                .lock()
+                .unwrap()
+                .cancel_question(&question.id, now_ms());
+            warn!(
+                "[{}] approval question delivery failed; cancelling the dialog",
+                self.job.thread
+            );
+            return UiResponse::Cancelled;
+        }
+        let _ = self
+            .ctx
+            .history
+            .lock()
+            .unwrap()
+            .mark_question_delivery(&question.id, crate::approval::DeliveryStatus::Delivered);
+
+        let deadline = tokio::time::Instant::now() + self.timeout;
+        loop {
+            let answer = self
+                .ctx
+                .history
+                .lock()
+                .unwrap()
+                .take_answer(&question.id, now_ms())
+                .ok()
+                .flatten();
+            if let Some(answer) = answer {
+                return if confirm {
+                    UiResponse::Confirm(answer.value.eq_ignore_ascii_case("allow"))
+                } else {
+                    UiResponse::Select(answer.value)
+                };
+            }
+            if tokio::time::Instant::now() >= deadline {
+                let _ = self
+                    .ctx
+                    .history
+                    .lock()
+                    .unwrap()
+                    .cancel_question(&question.id, now_ms());
+                return UiResponse::Cancelled;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    }
 }

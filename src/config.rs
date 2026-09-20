@@ -139,6 +139,17 @@ pub struct Config {
     /// How long an rpc child may sit unused before it is reaped.
     #[serde(default = "default_rpc_idle_timeout")]
     pub rpc_idle_timeout: String,
+    /// Tool names the approval gate blocks until the user answers (PLAN §7).
+    /// Empty disables the gate entirely, so an rpc child never prompts.
+    #[serde(default)]
+    pub approval_gated_tools: Vec<String>,
+    /// How long an approval question stays open before it is cancelled.
+    #[serde(default = "default_approval_timeout")]
+    pub approval_timeout: String,
+    /// Absolute path to the shipped `extensions/tool_gate.ts`. Required when
+    /// `approval_gated_tools` is non-empty.
+    #[serde(default)]
+    pub approval_gate_extension: Option<String>,
     #[serde(default)]
     pub routes: Vec<RouteRule>,
     /// Canonical root of the single user-owned assistant repository.
@@ -433,6 +444,29 @@ impl Config {
             max_sessions: self.rpc_pool_max,
             idle_timeout: self.rpc_idle_timeout_dur()?,
         })
+    }
+
+    pub fn approval_timeout_dur(&self) -> Result<Duration> {
+        humantime::parse_duration(&self.approval_timeout)
+            .with_context(|| format!("invalid approval_timeout {}", self.approval_timeout))
+    }
+
+    /// True when an rpc child should load the approval gate. No gated tools
+    /// means no gate, so an rpc child can never prompt unexpectedly.
+    pub fn approval_gate_enabled(&self) -> bool {
+        !self.approval_gated_tools.is_empty()
+    }
+
+    /// The absolute gate-extension path, when the gate is enabled.
+    pub fn approval_gate_extension_path(&self) -> Option<std::path::PathBuf> {
+        if !self.approval_gate_enabled() {
+            return None;
+        }
+        self.approval_gate_extension
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(std::path::PathBuf::from)
     }
 
     pub fn agent_backend(&self) -> Result<AgentBackend> {
@@ -807,6 +841,19 @@ impl Config {
             bail!("rpc_pool_max must be positive");
         }
         self.rpc_idle_timeout_dur()?;
+        self.approval_timeout_dur()?;
+        if self.approval_gate_enabled() {
+            let extension = self.approval_gate_extension.as_deref().map(str::trim);
+            match extension.filter(|value| !value.is_empty()) {
+                None => {
+                    bail!("approval_gate_extension is required when approval_gated_tools is set")
+                }
+                Some(path) if !std::path::Path::new(path).is_file() => {
+                    bail!("approval_gate_extension {path:?} does not exist")
+                }
+                Some(_) => {}
+            }
+        }
         self.jobs_backend()?;
         if self.jobs_max_timeout_dur()?.is_zero() {
             bail!("jobs_max_timeout must be positive");
@@ -1276,6 +1323,9 @@ fn default_rpc_pool_max() -> usize {
 fn default_rpc_idle_timeout() -> String {
     "10m".to_string()
 }
+fn default_approval_timeout() -> String {
+    "10m".to_string()
+}
 fn default_voice_name() -> String {
     DEFAULT_VOICE_NAME.to_string()
 }
@@ -1325,6 +1375,9 @@ mod tests {
             pi_mode: "print".to_string(),
             rpc_pool_max: 12,
             rpc_idle_timeout: "10m".to_string(),
+            approval_gated_tools: Vec::new(),
+            approval_timeout: "10m".to_string(),
+            approval_gate_extension: None,
             routes: Vec::new(),
             assistant_root: root.to_string_lossy().to_string(),
             jobs_dir: root.join("jobs").to_string_lossy().to_string(),
@@ -1538,6 +1591,24 @@ mod tests {
         assert!(!default.pi_rpc_enabled());
         assert_eq!(default.rpc_pool_max, 12);
         assert_eq!(default.rpc_idle_timeout, "10m");
+        assert!(!default.approval_gate_enabled());
+        assert_eq!(
+            default.approval_timeout_dur().unwrap(),
+            Duration::from_secs(600)
+        );
+
+        // A gate needs both tools and an existing extension file.
+        let mut gated = config();
+        gated.approval_gated_tools = vec!["bash".to_string()];
+        assert!(gated.validate().is_err());
+        gated.approval_gate_extension = Some("/does/not/exist.ts".to_string());
+        assert!(gated.validate().is_err());
+        let extension = crate::test_support::temp_dir("gate-extension");
+        let path = extension.join("tool_gate.ts");
+        std::fs::write(&path, "// gate").unwrap();
+        gated.approval_gate_extension = Some(path.to_string_lossy().to_string());
+        assert!(gated.validate().is_ok());
+        assert!(gated.approval_gate_enabled());
 
         let rpc: Config = toml::from_str(
             "agent = 'pi'\npi_mode = 'rpc'\nrpc_pool_max = 3\nrpc_idle_timeout = '30s'",
