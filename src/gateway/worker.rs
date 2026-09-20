@@ -10,7 +10,7 @@ use anyhow::{Context, Result};
 use tokio::sync::{mpsc, watch};
 use tracing::{error, info, warn};
 
-use crate::agent::{Request, RunError};
+use crate::agent::{Request, RunError, RunOutput, Runner};
 use crate::attachments::{DownloadedFile, PreparedFiles, MAX_FILE_BYTES, MAX_FILE_COUNT};
 use crate::history::{DeliveryStatus, OutboundMessage, OutboundOrigin};
 use crate::image::{PreparedImages, MAX_IMAGE_BYTES, MAX_IMAGE_COUNT};
@@ -326,20 +326,19 @@ where
             runner.label(),
             prompt.rehydrated_messages
         );
-        let mut result = runner
-            .run(
-                backend_request(
-                    &session_id,
-                    is_new,
-                    &work_dir,
-                    &prompt,
-                    &attachment_paths,
-                    job.model.as_deref(),
-                    job.thinking.as_deref(),
-                ),
-                ctx.run_timeout,
-            )
-            .await;
+        let mut result = dispatch(
+            ctx,
+            runner,
+            &job,
+            BackendTurn {
+                session_id: &session_id,
+                is_new,
+                work_dir: &work_dir,
+                prompt: &prompt,
+                attachment_paths: &attachment_paths,
+            },
+        )
+        .await;
         // If the session id already exists (e.g. left over from a previous run
         // or a different build), resume it instead of trying to create it again.
         if is_new {
@@ -349,20 +348,19 @@ where
                     prompt = conversation_prompt(ctx, &job, &composer, false).map_err(|error| {
                         RunError::Failed(format!("compose resumed prompt: {error}"))
                     })?;
-                    result = runner
-                        .run(
-                            backend_request(
-                                &session_id,
-                                false,
-                                &work_dir,
-                                &prompt,
-                                &attachment_paths,
-                                job.model.as_deref(),
-                                job.thinking.as_deref(),
-                            ),
-                            ctx.run_timeout,
-                        )
-                        .await;
+                    result = dispatch(
+                        ctx,
+                        runner,
+                        &job,
+                        BackendTurn {
+                            session_id: &session_id,
+                            is_new: false,
+                            work_dir: &work_dir,
+                            prompt: &prompt,
+                            attachment_paths: &attachment_paths,
+                        },
+                    )
+                    .await;
                 }
             }
         } else if matches!(&result, Err(RunError::SessionMissing(_))) {
@@ -411,20 +409,19 @@ where
                     prompt.rehydrated_messages,
                 ),
             );
-            result = runner
-                .run(
-                    backend_request(
-                        &session_id,
-                        true,
-                        &work_dir,
-                        &prompt,
-                        &attachment_paths,
-                        job.model.as_deref(),
-                        job.thinking.as_deref(),
-                    ),
-                    ctx.run_timeout,
-                )
-                .await;
+            result = dispatch(
+                ctx,
+                runner,
+                &job,
+                BackendTurn {
+                    session_id: &session_id,
+                    is_new: true,
+                    work_dir: &work_dir,
+                    prompt: &prompt,
+                    attachment_paths: &attachment_paths,
+                },
+            )
+            .await;
         }
         result
     };
@@ -917,7 +914,11 @@ fn command(ctx: &Ctx, job: &Job) -> Option<String> {
                 .map(|r| r.initial_session_id())
                 .unwrap_or_default(),
         ) {
-            Ok(()) => Some("Started a fresh conversation.".to_string()),
+            Ok(()) => {
+                // A rotated session must not keep serving the old rpc child.
+                ctx.pool.evict(&job.thread);
+                Some("Started a fresh conversation.".to_string())
+            }
             Err(_) => Some("Couldn't reset the conversation.".to_string()),
         },
         "/help" => Some(
@@ -1215,4 +1216,70 @@ fn backend_request<'a>(
         model,
         thinking,
     }
+}
+
+/// One backend turn's inputs, bundled so [`dispatch`] stays readable.
+struct BackendTurn<'a> {
+    session_id: &'a str,
+    is_new: bool,
+    work_dir: &'a str,
+    prompt: &'a ComposedPrompt,
+    attachment_paths: &'a [PathBuf],
+}
+
+/// Runs one backend turn: the per-thread rpc pool for `Runner::PiRpc` (PLAN §7
+/// step 2), the one-shot `Runner::run` for every other runner. The audit
+/// events, prompt composition, and session persistence around the call are
+/// identical either way, so flipping `pi_mode` cannot change the recorded rows.
+async fn dispatch(
+    ctx: &Ctx,
+    runner: &Runner,
+    job: &Job,
+    turn: BackendTurn<'_>,
+) -> Result<RunOutput, RunError> {
+    let BackendTurn {
+        session_id,
+        is_new,
+        work_dir,
+        prompt,
+        attachment_paths,
+    } = turn;
+    if !runner.is_rpc() {
+        return runner
+            .run(
+                backend_request(
+                    session_id,
+                    is_new,
+                    work_dir,
+                    prompt,
+                    attachment_paths,
+                    job.model.as_deref(),
+                    job.thinking.as_deref(),
+                ),
+                ctx.run_timeout,
+            )
+            .await;
+    }
+    let spec = crate::pi::PiRpcSpec {
+        bin: ctx.cfg.agent_bin(job.backend).to_string(),
+        session_id: session_id.to_string(),
+        is_new,
+        work_dir: work_dir.to_string(),
+        instructions: prompt.instructions.clone(),
+        model: job.model.clone(),
+        thinking: job.thinking.clone(),
+        images: attachment_paths.to_vec(),
+        // Step 3 wires the approval gate's `GATE_TOOLS` here; step 2 ships the
+        // pool with no gate so the rpc path cannot prompt unexpectedly.
+        env: Vec::new(),
+    };
+    ctx.pool
+        .run(
+            &job.thread,
+            spec,
+            &prompt.content,
+            ctx.run_timeout,
+            |_request| crate::pi::rpc::UiResponse::Cancelled,
+        )
+        .await
 }

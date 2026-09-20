@@ -27,6 +27,7 @@
 use std::collections::VecDeque;
 use std::io;
 use std::process::Stdio;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -37,6 +38,10 @@ use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 /// Malformed lines tolerated before a run is declared broken, so a hostile or
 /// corrupt stream cannot spin the read loop forever.
 const MAX_SKIPPED_LINES: usize = 100;
+
+/// Bytes of stderr kept for error classification. pi reports a missing
+/// `--session` on stderr before exiting; stdout (the protocol stream) is silent.
+const STDERR_TAIL_LIMIT: usize = 4096;
 
 /// One extension-UI request the child is blocked waiting on.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -106,6 +111,9 @@ pub struct Session {
     child: Child,
     stdin: ChildStdin,
     events: Lines<BufReader<ChildStdout>>,
+    /// Rolling stderr tail, drained by a background task so a full pipe can
+    /// never block the child. Only consulted to classify a fatal error.
+    stderr_tail: Arc<Mutex<String>>,
     session_id: Option<String>,
 }
 
@@ -113,31 +121,56 @@ impl Session {
     /// Spawns a child from an explicit argv tail (everything after the binary).
     /// The caller owns the flags (`--mode rpc`, `--session`, `-e`, …) and the
     /// environment (`GATE_TOOLS`, …), so this module stays protocol-only.
-    pub fn spawn(bin: &str, args: &[String], env: &[(String, String)]) -> Result<Self> {
+    pub fn spawn(
+        bin: &str,
+        args: &[String],
+        env: &[(String, String)],
+        work_dir: &str,
+    ) -> Result<Self> {
         let mut command = Command::new(bin);
         command.args(args);
         for (key, value) in env {
             command.env(key, value);
         }
         let mut child = command
+            .current_dir(work_dir)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .kill_on_drop(true)
             .spawn()
             .with_context(|| format!("spawn {bin} --mode rpc"))?;
         let stdin = child.stdin.take().context("pi rpc stdin unavailable")?;
         let stdout = child.stdout.take().context("pi rpc stdout unavailable")?;
+        let stderr = child.stderr.take().context("pi rpc stderr unavailable")?;
+        let stderr_tail = Arc::new(Mutex::new(String::new()));
+        let sink = stderr_tail.clone();
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(stderr).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                let mut tail = sink.lock().unwrap();
+                if tail.len() < STDERR_TAIL_LIMIT {
+                    tail.push_str(&line);
+                    tail.push('\n');
+                }
+            }
+        });
         Ok(Self {
             child,
             stdin,
             events: BufReader::new(stdout).lines(),
+            stderr_tail,
             session_id: None,
         })
     }
 
     pub fn session_id(&self) -> Option<&str> {
         self.session_id.as_deref()
+    }
+
+    /// Best-effort stderr seen so far, for classifying a fatal spawn/init error.
+    pub fn stderr_tail(&self) -> String {
+        self.stderr_tail.lock().unwrap().clone()
     }
 
     async fn send(&mut self, command: &Value) -> Result<()> {
@@ -439,8 +472,13 @@ done
     #[tokio::test]
     async fn init_reads_the_session_id_from_get_state() {
         let cli = FakeCli::new("rpc-init", &spam());
-        let mut session =
-            Session::spawn(&cli.bin(), &["--mode".to_string(), "rpc".to_string()], &[]).unwrap();
+        let mut session = Session::spawn(
+            &cli.bin(),
+            &["--mode".to_string(), "rpc".to_string()],
+            &[],
+            ".",
+        )
+        .unwrap();
         let id = session.init(Duration::from_secs(5)).await.unwrap();
         assert_eq!(id, "sess-1");
         assert_eq!(session.session_id(), Some("sess-1"));
@@ -450,8 +488,13 @@ done
     #[tokio::test]
     async fn turn_answers_a_select_and_returns_the_final_text() {
         let cli = FakeCli::new("rpc-turn", &spam());
-        let mut session =
-            Session::spawn(&cli.bin(), &["--mode".to_string(), "rpc".to_string()], &[]).unwrap();
+        let mut session = Session::spawn(
+            &cli.bin(),
+            &["--mode".to_string(), "rpc".to_string()],
+            &[],
+            ".",
+        )
+        .unwrap();
         session.init(Duration::from_secs(5)).await.unwrap();
 
         let seen = Arc::new(Mutex::new(Vec::new()));
@@ -485,8 +528,13 @@ done
         // request; the turn above already proved it does not abort. Here we
         // assert directly on the reader contract.
         let cli = FakeCli::new("rpc-skip", &spam());
-        let mut session =
-            Session::spawn(&cli.bin(), &["--mode".to_string(), "rpc".to_string()], &[]).unwrap();
+        let mut session = Session::spawn(
+            &cli.bin(),
+            &["--mode".to_string(), "rpc".to_string()],
+            &[],
+            ".",
+        )
+        .unwrap();
         session.init(Duration::from_secs(5)).await.unwrap();
         let outcome = session
             .turn("go", Duration::from_secs(5), |_| UiResponse::Cancelled)

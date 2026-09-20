@@ -60,6 +60,9 @@ struct Ctx {
     history: Arc<Mutex<History>>,
     ack: Arc<Mutex<AckState>>,
     runners: Arc<HashMap<AgentBackend, Runner>>,
+    /// Per-thread long-lived `pi --mode rpc` children, shared by every channel
+    /// like `runners` (DESIGN §1). Unused while `pi_mode = "print"`.
+    pool: Arc<crate::pi::Pool>,
     channel: Channel,
     run_timeout: Duration,
     reply_marker: String,
@@ -141,6 +144,7 @@ impl GatewayGroup {
             })?,
         ));
         let runners = Arc::new(runners(&cfg));
+        let pool = Arc::new(crate::pi::Pool::new(cfg.rpc_pool_config()?));
         let audit_lock = Arc::new(Mutex::new(()));
         let mut gateways = Vec::with_capacity(enabled.len());
         for spec in enabled {
@@ -150,6 +154,7 @@ impl GatewayGroup {
                 store.clone(),
                 history.clone(),
                 runners.clone(),
+                pool.clone(),
                 audit_lock.clone(),
             )?);
         }
@@ -254,9 +259,22 @@ impl GatewayGroup {
             .iter()
             .map(|gateway| (gateway.channel.store_key(), gateway.ctx.clone()))
             .collect::<HashMap<_, _>>();
+        // Every channel shares one pool, so one janitor reaps idle children for
+        // the whole group (DESIGN §1). Only meaningful in rpc mode.
+        let pool = if self.cfg.pi_rpc_enabled() {
+            self.gateways
+                .first()
+                .map(|gateway| gateway.ctx.pool.clone())
+        } else {
+            None
+        };
         let receiver = shutdown_rx.clone();
         let scheduler =
             tokio::spawn(async move { run_scheduler(scheduler, contexts, receiver).await });
+        let janitor = pool.map(|pool| {
+            let receiver = shutdown_rx.clone();
+            tokio::spawn(async move { run_pool_janitor(pool, receiver).await })
+        });
         let mut tasks = JoinSet::new();
         for gateway in self.gateways {
             let channel = gateway.channel.id();
@@ -271,12 +289,40 @@ impl GatewayGroup {
         }
         drop(shutdown_rx);
         let result = coordinate_channel_tasks(tasks, shutdown_tx, shutdown).await;
+        if let Some(janitor) = janitor {
+            janitor.abort();
+            let _ = janitor.await;
+        }
         match scheduler.await {
             Ok(Ok(())) => {}
             Ok(Err(error)) => error!("job scheduler stopped: {error:#}"),
             Err(error) => error!("job scheduler task failed: {error}"),
         }
         result
+    }
+}
+
+/// Reaps idle `pi --mode rpc` children on a fixed cadence. Runs on the group's
+/// shared pool; skips any thread with a run in flight.
+async fn run_pool_janitor(pool: Arc<crate::pi::Pool>, mut shutdown: watch::Receiver<bool>) {
+    let idle = pool.idle_timeout();
+    let cadence = (idle / 2).clamp(Duration::from_secs(1), Duration::from_secs(60));
+    let mut ticker = tokio::time::interval(cadence);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // The first tick is immediate; skip it so startup does not sweep an
+    // (empty) pool before anything has run.
+    ticker.tick().await;
+    loop {
+        let sweep = async {
+            ticker.tick().await;
+            pool.sweep_idle().await;
+        };
+        if wait_for_channel_shutdown_or(&mut shutdown, sweep)
+            .await
+            .is_none()
+        {
+            break;
+        }
     }
 }
 
@@ -392,12 +438,21 @@ impl Gateway {
             })?,
         ));
         let runners = Arc::new(runners(&cfg));
+        let pool = Arc::new(crate::pi::Pool::new(cfg.rpc_pool_config()?));
         let spec = cfg
             .enabled_channels()?
             .into_iter()
             .next()
             .context("at least one reply channel must be enabled")?;
-        Self::new_with_shared(cfg, spec, store, history, runners, Arc::new(Mutex::new(())))
+        Self::new_with_shared(
+            cfg,
+            spec,
+            store,
+            history,
+            runners,
+            pool,
+            Arc::new(Mutex::new(())),
+        )
     }
 
     fn new_with_shared(
@@ -406,6 +461,7 @@ impl Gateway {
         store: Arc<Mutex<Store>>,
         history: Arc<Mutex<History>>,
         runners: Arc<HashMap<AgentBackend, Runner>>,
+        pool: Arc<crate::pi::Pool>,
         audit_lock: Arc<Mutex<()>>,
     ) -> Result<Self> {
         let ack = Arc::new(Mutex::new(AckState::default()));
@@ -422,6 +478,7 @@ impl Gateway {
             history,
             ack: ack.clone(),
             runners,
+            pool,
             channel: channel.clone(),
             run_timeout: cfg.run_timeout_dur()?,
             reply_marker: crate::channel::REPLY_MARKER.to_string(),

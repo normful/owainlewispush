@@ -53,6 +53,10 @@ pub enum Runner {
     Claude(claude::Runner),
     Codex(codex::Runner),
     Pi(pi::Runner),
+    /// Long-lived `pi --mode rpc` pool behind `pi_mode = "rpc"`. The worker
+    /// dispatches rpc runs to `Ctx.pool`; every other caller (evaluators,
+    /// unattended jobs) still uses the one-shot `pi::Runner` carried here.
+    PiRpc(pi::Runner),
     #[cfg(test)]
     Fake(FakeRunner),
 }
@@ -88,9 +92,16 @@ impl Runner {
                 bin: cfg.agent_bin(backend).to_string(),
                 cache_dir: cfg.paths.cache.clone(),
             }),
-            AgentBackend::Pi => Runner::Pi(pi::Runner {
-                bin: cfg.agent_bin(backend).to_string(),
-            }),
+            AgentBackend::Pi => {
+                let runner = pi::Runner {
+                    bin: cfg.agent_bin(backend).to_string(),
+                };
+                if cfg.pi_rpc_enabled() {
+                    Runner::PiRpc(runner)
+                } else {
+                    Runner::Pi(runner)
+                }
+            }
         }
     }
 
@@ -98,7 +109,7 @@ impl Runner {
         match self {
             Runner::Claude(_) => AgentBackend::Claude,
             Runner::Codex(_) => AgentBackend::Codex,
-            Runner::Pi(_) => AgentBackend::Pi,
+            Runner::Pi(_) | Runner::PiRpc(_) => AgentBackend::Pi,
             #[cfg(test)]
             Runner::Fake(r) => r.backend,
         }
@@ -108,17 +119,22 @@ impl Runner {
         match self {
             Runner::Claude(_) => "Claude",
             Runner::Codex(_) => "Codex",
-            Runner::Pi(_) => "Pi",
+            Runner::Pi(_) | Runner::PiRpc(_) => "Pi",
             #[cfg(test)]
             Runner::Fake(_) => "Fake",
         }
     }
 
+    /// True for the long-lived rpc runner, which the worker dispatches to the
+    /// pool instead of `Runner::run`.
+    pub fn is_rpc(&self) -> bool {
+        matches!(self, Runner::PiRpc(_))
+    }
+
     pub fn initial_session_id(&self) -> String {
         match self {
             Runner::Claude(_) => Uuid::new_v4().to_string(),
-            Runner::Codex(_) => String::new(),
-            Runner::Pi(_) => String::new(),
+            Runner::Codex(_) | Runner::Pi(_) | Runner::PiRpc(_) => String::new(),
             #[cfg(test)]
             Runner::Fake(_) => String::new(),
         }
@@ -132,7 +148,7 @@ impl Runner {
         match self {
             Runner::Claude(r) => r.run(req, timeout).await,
             Runner::Codex(r) => r.run(req, timeout).await,
-            Runner::Pi(r) => r.run(req, timeout).await,
+            Runner::Pi(r) | Runner::PiRpc(r) => r.run(req, timeout).await,
             #[cfg(test)]
             Runner::Fake(r) => r.run(req, timeout).await,
         }
@@ -147,7 +163,7 @@ impl Runner {
         match self {
             Runner::Claude(r) => r.run_unattended(req, timeout).await,
             Runner::Codex(r) => r.run_unattended(req, timeout).await,
-            Runner::Pi(r) => {
+            Runner::Pi(r) | Runner::PiRpc(r) => {
                 r.run_unattended(req, timeout, trust_project_resources)
                     .await
             }
@@ -164,7 +180,7 @@ impl Runner {
         match self {
             Runner::Claude(r) => r.run_evaluator(req, timeout).await,
             Runner::Codex(r) => r.run_evaluator(req, timeout).await,
-            Runner::Pi(r) => r.run_evaluator(req, timeout).await,
+            Runner::Pi(r) | Runner::PiRpc(r) => r.run_evaluator(req, timeout).await,
             #[cfg(test)]
             Runner::Fake(r) => r.run(req, timeout).await,
         }

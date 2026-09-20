@@ -245,11 +245,12 @@ fn check_config(cfg: &config::Config, checks: &mut Vec<Check>) {
     checks.push(Check::pass(
         "config",
         format!(
-            "channels={}, agent={}, assistant_root={}, imessage.self_handles={}, imessage.allow_from={}, telegram.allow_user_ids={}, telegram.allow_chat_ids={}, slack.allow_user_ids={}, discord.channel_id={:?}",
+            "channels={}, agent={}, pi_mode={}, assistant_root={}, imessage.self_handles={}, imessage.allow_from={}, telegram.allow_user_ids={}, telegram.allow_chat_ids={}, slack.allow_user_ids={}, discord.channel_id={:?}",
             cfg.enabled_channel_kinds()
                 .map(|channels| channels.into_iter().map(|kind| kind.as_str()).collect::<Vec<_>>().join(","))
                 .unwrap_or_else(|_| cfg.channel.clone()),
             cfg.agent,
+            cfg.pi_mode,
             cfg.assistant_root,
             cfg.self_handles.len(),
             cfg.allow_from.len(),

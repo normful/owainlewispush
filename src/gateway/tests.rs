@@ -4,7 +4,9 @@ use crate::agent::{FakeRunCall, FakeRunner};
 use crate::approval::Question;
 use crate::channel::{normalize_handle, thread_handle, InboundImage, InboundVoice};
 use crate::history::DeliveryStatus;
+use crate::history::{ConversationMessage, ConversationRole};
 use crate::imessage::{Poller, Sender};
+use crate::test_support::{sh_arg, FakeCli};
 use crate::voice::{AudioClip, VoiceFuture, VoiceProvider};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -221,6 +223,7 @@ fn setup_failure_ctx(
         history: Arc::new(Mutex::new(history)),
         ack,
         runners: Arc::new(runners),
+        pool: Arc::new(crate::pi::Pool::new(Default::default())),
         channel: filter(),
         run_timeout: Duration::from_secs(1),
         reply_marker: String::new(),
@@ -3976,6 +3979,136 @@ async fn retired_job_approval_reply_explains_direct_creation() {
     assert!(calls.lock().unwrap().is_empty());
 }
 
+/// The fake `pi --mode rpc` behind `pi_mode = "rpc"`: one child answers
+/// `get_state`, settles every prompt, and returns a fixed final text. It
+/// appends to `marker` once per spawn, so the test can prove reuse.
+fn fake_rpc_pi(marker: &Path) -> String {
+    format!(
+        r#"#!/bin/sh
+printf 'x' >> {marker}
+while IFS= read -r line; do
+  case "$line" in
+    *"get_state"*)
+      printf '%s\n' '{{"type":"response","command":"get_state","id":"push-state","data":{{"sessionId":"fake-session","model":{{"id":"m"}},"thinkingLevel":"high"}}}}'
+      ;;
+    *"get_last_assistant_text"*)
+      printf '%s\n' '{{"type":"response","command":"get_last_assistant_text","id":"push-final","data":{{"text":"reply"}}}}'
+      ;;
+    *'"type":"prompt"'*)
+      printf '%s\n' '{{"type":"agent_settled"}}'
+      ;;
+  esac
+done
+"#,
+        marker = sh_arg(marker),
+    )
+}
+
+/// The fake one-shot `pi --print --mode json`, the same shape as `pi.rs`'s
+/// contract fixtures. Appends to `marker` once per process.
+fn fake_print_pi(marker: &Path) -> String {
+    format!(
+        "#!/bin/sh\nprintf 'x' >> {}\ncat >/dev/null\nprintf '%s\\n' '{{\"type\":\"session\",\"id\":\"fake-session\"}}'\nprintf '%s\\n' '{{\"type\":\"message_end\",\"message\":{{\"role\":\"assistant\",\"content\":[{{\"type\":\"text\",\"text\":\"reply\"}}],\"stopReason\":\"stop\"}}}}'\n",
+        sh_arg(marker),
+    )
+}
+
+type PiPathResult = (
+    Vec<(String, String)>,
+    (String, bool),
+    Vec<ConversationMessage>,
+    usize,
+);
+
+/// Runs two messages on one thread through `Gateway` in `mode`, failing the
+/// test on any setup error, and returns the delivered replies, the stored
+/// session row `(id, is_new)`, the canonical history, and the child spawn count.
+async fn run_pi_path(mode: &str, script: fn(&Path) -> String) -> PiPathResult {
+    let thread = "imessage:dm:+15551234567";
+    let state_path = temp_state_path();
+    let assistant_dir = temp_path(&format!("pi-{mode}-assistant"));
+    std::fs::create_dir_all(assistant_dir.join("context")).unwrap();
+    std::fs::create_dir_all(assistant_dir.join("jobs")).unwrap();
+    std::fs::write(assistant_dir.join("SOUL.md"), "Be useful.\n").unwrap();
+    let marker = temp_path(&format!("pi-{mode}-marker"));
+    let cli = FakeCli::new(&format!("pi-{mode}"), &script(&marker));
+
+    let mut cfg = test_config(&state_path, &state_path, assistant_dir.to_str().unwrap());
+    cfg.agent = "pi".to_string();
+    cfg.pi_mode = mode.to_string();
+    cfg.agent_commands.pi = cli.bin();
+    let mut gateway = Gateway::new(cfg).unwrap();
+    gateway
+        .tick_fake(vec![
+            message(1, "+15551234567", "+15551234567", false, "first"),
+            message(2, "+15551234567", "+15551234567", false, "second"),
+        ])
+        .await;
+    gateway.queues.clear();
+    gateway.drain_workers().await;
+
+    let replies = gateway.ctx.sent_replies.lock().unwrap().clone();
+    let session = gateway
+        .store
+        .lock()
+        .unwrap()
+        .session_for(thread, "pi", String::new())
+        .unwrap();
+    let messages = gateway
+        .ctx
+        .history
+        .lock()
+        .unwrap()
+        .recent_messages_before("imessage", thread, i64::MAX, 50)
+        .unwrap();
+    let spawns = std::fs::read_to_string(&marker)
+        .map(|marker| marker.len())
+        .unwrap_or(0);
+    (replies, session, messages, spawns)
+}
+
+/// PLAN §7 step 2 verification: with `pi_mode = "rpc"` one child serves two
+/// turns on one thread, and the canonical rows match the unchanged print path.
+#[tokio::test]
+async fn rpc_mode_reuses_one_child_and_records_the_same_rows_as_print() {
+    let (print_replies, print_session, print_messages, print_spawns) =
+        run_pi_path("print", fake_print_pi).await;
+    let (rpc_replies, rpc_session, rpc_messages, rpc_spawns) =
+        run_pi_path("rpc", fake_rpc_pi).await;
+
+    assert_eq!(
+        print_spawns, 2,
+        "print spawns one one-shot child per message"
+    );
+    assert_eq!(rpc_spawns, 1, "rpc reuses one child for both turns");
+
+    assert_eq!(rpc_replies, print_replies);
+    assert_eq!(rpc_session, print_session);
+    assert_eq!(rpc_session, ("fake-session".to_string(), false));
+    assert_eq!(rpc_messages, print_messages);
+    assert_eq!(
+        rpc_messages,
+        vec![
+            ConversationMessage {
+                role: ConversationRole::User,
+                content: "first".to_string(),
+            },
+            ConversationMessage {
+                role: ConversationRole::Assistant,
+                content: "reply".to_string(),
+            },
+            ConversationMessage {
+                role: ConversationRole::User,
+                content: "second".to_string(),
+            },
+            ConversationMessage {
+                role: ConversationRole::Assistant,
+                content: "reply".to_string(),
+            },
+        ]
+    );
+}
+
 fn test_config(state_path: &str, _sessions_dir: &str, assistant_dir: &str) -> Config {
     Config {
         channel: "imessage".to_string(),
@@ -4000,6 +4133,9 @@ fn test_config(state_path: &str, _sessions_dir: &str, assistant_dir: &str) -> Co
         voice_gemini_base_url: None,
         voice_name: crate::config::DEFAULT_VOICE_NAME.to_string(),
         agent: "codex".to_string(),
+        pi_mode: "print".to_string(),
+        rpc_pool_max: 12,
+        rpc_idle_timeout: "10m".to_string(),
         routes: Vec::new(),
         assistant_root: assistant_dir.to_string(),
         jobs_dir: format!("{state_path}.jobs"),

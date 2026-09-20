@@ -1,10 +1,13 @@
 //! Runs the Pi coding agent headlessly for a single message.
 
-/// Long-lived `pi --mode rpc` session. Nothing wires this in yet: PLAN §7 lands
-/// the protocol module first, with no behavior change, then the pool/config
-/// switch. The one-shot `Runner` remains the production path until then.
+pub(crate) mod pool;
+/// Long-lived `pi --mode rpc` session and its per-thread pool. PLAN §7 step 2
+/// wires the pool behind `pi_mode = "rpc"`; the default `"print"` one-shot
+/// path is unchanged. Nothing in `rpc` changes the print protocol.
 #[allow(dead_code)]
 pub(crate) mod rpc;
+
+pub(crate) use pool::{PiRpcSpec, Pool, PoolConfig};
 
 use std::ffi::OsString;
 use std::time::Duration;
@@ -244,7 +247,7 @@ fn exit_diagnostic(status: Option<i32>, parse_error: Option<&str>) -> String {
     }
 }
 
-fn missing_resume_error(message: &str) -> bool {
+pub(crate) fn missing_resume_error(message: &str) -> bool {
     message
         .to_ascii_lowercase()
         .contains("no session found matching")

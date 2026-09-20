@@ -126,6 +126,19 @@ pub struct Config {
     pub voice_name: String,
     #[serde(default = "default_agent")]
     pub agent: String,
+    /// Pi runner mode (PLAN §7): `"print"` runs `pi --print --mode json`
+    /// one-shot per message; `"rpc"` keeps one `pi --mode rpc` child per thread
+    /// so approvals and barge-in become possible. The default keeps the
+    /// unchanged one-shot path.
+    #[serde(default = "default_pi_mode")]
+    pub pi_mode: String,
+    /// Maximum concurrent `pi --mode rpc` children before the longest-idle one
+    /// is evicted (PLAN §7 step 2). Ignored when `pi_mode = "print"`.
+    #[serde(default = "default_rpc_pool_max")]
+    pub rpc_pool_max: usize,
+    /// How long an rpc child may sit unused before it is reaped.
+    #[serde(default = "default_rpc_idle_timeout")]
+    pub rpc_idle_timeout: String,
     #[serde(default)]
     pub routes: Vec<RouteRule>,
     /// Canonical root of the single user-owned assistant repository.
@@ -402,6 +415,24 @@ impl Config {
     pub fn run_timeout_dur(&self) -> Result<Duration> {
         humantime::parse_duration(&self.run_timeout)
             .with_context(|| format!("invalid run_timeout {}", self.run_timeout))
+    }
+
+    /// True when the configured Pi runner is the long-lived rpc pool.
+    pub fn pi_rpc_enabled(&self) -> bool {
+        self.pi_mode == "rpc"
+    }
+
+    pub fn rpc_idle_timeout_dur(&self) -> Result<Duration> {
+        humantime::parse_duration(&self.rpc_idle_timeout)
+            .with_context(|| format!("invalid rpc_idle_timeout {}", self.rpc_idle_timeout))
+    }
+
+    /// The pool limits for `pi_mode = "rpc"`.
+    pub fn rpc_pool_config(&self) -> Result<crate::pi::PoolConfig> {
+        Ok(crate::pi::PoolConfig {
+            max_sessions: self.rpc_pool_max,
+            idle_timeout: self.rpc_idle_timeout_dur()?,
+        })
     }
 
     pub fn agent_backend(&self) -> Result<AgentBackend> {
@@ -768,6 +799,14 @@ impl Config {
             }
         }
         self.agent_backend()?;
+        match self.pi_mode.as_str() {
+            "print" | "rpc" => {}
+            other => bail!("pi_mode must be \"print\" or \"rpc\", found {other:?}"),
+        }
+        if self.rpc_pool_max == 0 {
+            bail!("rpc_pool_max must be positive");
+        }
+        self.rpc_idle_timeout_dur()?;
         self.jobs_backend()?;
         if self.jobs_max_timeout_dur()?.is_zero() {
             bail!("jobs_max_timeout must be positive");
@@ -1228,6 +1267,15 @@ fn default_run_timeout() -> String {
 fn default_agent() -> String {
     "claude".to_string()
 }
+fn default_pi_mode() -> String {
+    "print".to_string()
+}
+fn default_rpc_pool_max() -> usize {
+    12
+}
+fn default_rpc_idle_timeout() -> String {
+    "10m".to_string()
+}
 fn default_voice_name() -> String {
     DEFAULT_VOICE_NAME.to_string()
 }
@@ -1274,6 +1322,9 @@ mod tests {
             voice_gemini_base_url: None,
             voice_name: DEFAULT_VOICE_NAME.to_string(),
             agent: "codex".to_string(),
+            pi_mode: "print".to_string(),
+            rpc_pool_max: 12,
+            rpc_idle_timeout: "10m".to_string(),
             routes: Vec::new(),
             assistant_root: root.to_string_lossy().to_string(),
             jobs_dir: root.join("jobs").to_string_lossy().to_string(),
@@ -1478,6 +1529,48 @@ mod tests {
 
         assert_eq!(cfg.agent_backend().unwrap(), AgentBackend::Pi);
         assert_eq!(cfg.agent_bin(AgentBackend::Pi), "pi");
+    }
+
+    #[test]
+    fn pi_mode_defaults_to_print_and_validates_rpc_limits() {
+        let default: Config = toml::from_str("agent = 'pi'").unwrap();
+        assert_eq!(default.pi_mode, "print");
+        assert!(!default.pi_rpc_enabled());
+        assert_eq!(default.rpc_pool_max, 12);
+        assert_eq!(default.rpc_idle_timeout, "10m");
+
+        let rpc: Config = toml::from_str(
+            "agent = 'pi'\npi_mode = 'rpc'\nrpc_pool_max = 3\nrpc_idle_timeout = '30s'",
+        )
+        .unwrap();
+        assert!(rpc.pi_rpc_enabled());
+        let pool = rpc.rpc_pool_config().unwrap();
+        assert_eq!(pool.max_sessions, 3);
+        assert_eq!(pool.idle_timeout, Duration::from_secs(30));
+
+        let mut bad_mode = config();
+        bad_mode.pi_mode = "stream".to_string();
+        assert!(bad_mode
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("pi_mode"));
+
+        let mut zero_cap = config();
+        zero_cap.rpc_pool_max = 0;
+        assert!(zero_cap
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("rpc_pool_max"));
+
+        let mut bad_idle = config();
+        bad_idle.rpc_idle_timeout = "not-a-duration".to_string();
+        assert!(bad_idle
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("rpc_idle_timeout"));
     }
 
     #[test]
