@@ -80,6 +80,9 @@ pub struct Gateway {
     ctx: Ctx,
     cfg: Config,
     poll_interval: Duration,
+    /// Set by [`Gateway::route`]/[`Gateway::stop`] during a tick; read and
+    /// cleared by [`Gateway::tick`] to drive the adaptive poll interval.
+    channel_active: bool,
     queues: HashMap<String, WorkerQueue>,
     handles: Vec<JoinHandle<()>>,
 }
@@ -440,6 +443,7 @@ impl Gateway {
             ctx,
             cfg,
             poll_interval,
+            channel_active: false,
             queues: HashMap::new(),
             handles: Vec::new(),
         })
@@ -476,25 +480,28 @@ impl Gateway {
         if let Some(result) = wait_for_channel_shutdown_or(&mut shutdown, self.skip_backlog()).await
         {
             result?;
-            let mut ticker = tokio::time::interval(self.poll_interval);
-            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let active_interval = self.poll_interval;
+            let idle_interval = self.cfg.poll_idle_interval_dur()?;
+            let max_interval = self.cfg.poll_max_interval_dur()?;
+            let mut backoff = PollBackoff::new(active_interval, idle_interval, max_interval);
             info!(
-                "{} gateway running, polling every {:?}",
+                "{} gateway running; polling every {:?} active / {:?}-{:?} idle",
                 self.channel.id(),
-                self.poll_interval
+                active_interval,
+                idle_interval,
+                max_interval
             );
 
             loop {
+                let sleep_for = backoff.next();
                 let poll = async {
-                    ticker.tick().await;
-                    self.tick().await;
+                    tokio::time::sleep(sleep_for).await;
+                    self.tick().await
                 };
-                if wait_for_channel_shutdown_or(&mut shutdown, poll)
-                    .await
-                    .is_none()
-                {
+                let Some(active) = wait_for_channel_shutdown_or(&mut shutdown, poll).await else {
                     break;
-                }
+                };
+                backoff.record(active);
             }
         }
         info!(
@@ -557,7 +564,8 @@ impl Gateway {
         Ok(())
     }
 
-    async fn tick(&mut self) {
+    async fn tick(&mut self) -> bool {
+        self.channel_active = false;
         let store_key = self.channel.store_key();
         let since = match self.store.lock().unwrap().cursor(&store_key) {
             Ok(cursor) => cursor,
@@ -566,19 +574,20 @@ impl Gateway {
                     "{} cursor read error; polling paused: {error:#}",
                     self.channel.id()
                 );
-                return;
+                return false;
             }
         };
         let msgs = match self.channel.poll(since).await {
             Ok(messages) => messages,
             Err(e) => {
                 error!("{} poll error: {e}", self.channel.id());
-                return;
+                return false;
             }
         };
 
         let complete_snapshot = self.channel.poll_is_complete_snapshot();
         self.process_messages(msgs, complete_snapshot).await;
+        self.channel_active
     }
 
     #[cfg(test)]
@@ -925,6 +934,7 @@ impl Gateway {
     }
 
     async fn route(&mut self, job: Job) -> bool {
+        self.channel_active = true;
         let row_id = job.row_id;
         let thread = job.thread.clone();
         let target = job.target.clone();
@@ -1080,6 +1090,7 @@ impl Gateway {
     }
 
     async fn stop(&mut self, job: Job) -> bool {
+        self.channel_active = true;
         let row_id = job.row_id;
         self.ack.lock().unwrap().in_flight.insert(row_id);
         let candidate_target = self.queues.get(&job.thread).and_then(|worker| {
@@ -1425,6 +1436,46 @@ impl AckState {
 
     fn mark_persisted(&mut self, row_id: i64) {
         self.completed.retain(|id| *id > row_id);
+    }
+}
+
+/// Adaptive poll scheduling (PLAN §3): poll at the active floor while a channel
+/// has traffic, then step the idle interval up (30s → 60s → cap) while it stays
+/// quiet. Traffic snaps straight back to the active floor.
+#[derive(Debug, Clone, Copy)]
+struct PollBackoff {
+    active: Duration,
+    idle: Duration,
+    max: Duration,
+    idle_step: Duration,
+    next: Duration,
+}
+
+impl PollBackoff {
+    fn new(active: Duration, idle: Duration, max: Duration) -> Self {
+        Self {
+            active,
+            idle,
+            max,
+            idle_step: idle,
+            next: Duration::ZERO,
+        }
+    }
+
+    /// The delay before the next poll. The first poll is immediate.
+    fn next(&self) -> Duration {
+        self.next
+    }
+
+    /// Fold in whether the poll that just ran saw traffic.
+    fn record(&mut self, active: bool) {
+        if active {
+            self.next = self.active;
+            self.idle_step = self.idle;
+        } else {
+            self.next = self.idle_step;
+            self.idle_step = (self.idle_step * 2).min(self.max);
+        }
     }
 }
 

@@ -3961,6 +3961,8 @@ fn test_config(state_path: &str, _sessions_dir: &str, assistant_dir: &str) -> Co
         primary_delivery: None,
         db_path: "fake-chat.db".to_string(),
         poll_interval: "1s".to_string(),
+        poll_idle_interval: "30s".to_string(),
+        poll_max_interval: "60s".to_string(),
         run_timeout: "1s".to_string(),
         self_handles: vec!["me@icloud.com".to_string()],
         allow_from: vec!["+15551234567".to_string()],
@@ -4178,4 +4180,27 @@ fn slack_image_message(
         is_supported: true,
         thread_id: None,
     }
+}
+
+#[test]
+fn poll_backoff_steps_idle_then_snaps_back_on_traffic() {
+    let secs = Duration::from_secs;
+    let mut backoff = PollBackoff::new(secs(2), secs(30), secs(60));
+
+    // First poll is immediate.
+    assert_eq!(backoff.next(), Duration::ZERO);
+
+    // Two quiet polls step 30s then 60s, and stay capped.
+    backoff.record(false);
+    assert_eq!(backoff.next(), secs(30));
+    backoff.record(false);
+    assert_eq!(backoff.next(), secs(60));
+    backoff.record(false);
+    assert_eq!(backoff.next(), secs(60));
+
+    // Traffic snaps straight back to the active floor and resets the idle step.
+    backoff.record(true);
+    assert_eq!(backoff.next(), secs(2));
+    backoff.record(false);
+    assert_eq!(backoff.next(), secs(30));
 }

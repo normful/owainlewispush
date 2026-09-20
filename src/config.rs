@@ -48,8 +48,16 @@ pub struct Config {
     pub primary_delivery: Option<PrimaryDeliveryConfig>,
     #[serde(default = "default_db_path")]
     pub db_path: String,
+    /// Adaptive poll floor while the channel is active (PLAN §3).
     #[serde(default = "default_poll_interval")]
     pub poll_interval: String,
+    /// Poll interval once the channel goes idle; doubles up to
+    /// `poll_max_interval` while it stays quiet (PLAN §3).
+    #[serde(default = "default_poll_idle_interval")]
+    pub poll_idle_interval: String,
+    /// Ceiling for the idle backoff (PLAN §3).
+    #[serde(default = "default_poll_max_interval")]
+    pub poll_max_interval: String,
     #[serde(default = "default_run_timeout")]
     pub run_timeout: String,
     #[serde(default)]
@@ -353,6 +361,16 @@ impl Config {
     pub fn poll_interval_dur(&self) -> Result<Duration> {
         humantime::parse_duration(&self.poll_interval)
             .with_context(|| format!("invalid poll_interval {}", self.poll_interval))
+    }
+
+    pub fn poll_idle_interval_dur(&self) -> Result<Duration> {
+        humantime::parse_duration(&self.poll_idle_interval)
+            .with_context(|| format!("invalid poll_idle_interval {}", self.poll_idle_interval))
+    }
+
+    pub fn poll_max_interval_dur(&self) -> Result<Duration> {
+        humantime::parse_duration(&self.poll_max_interval)
+            .with_context(|| format!("invalid poll_max_interval {}", self.poll_max_interval))
     }
 
     pub fn run_timeout_dur(&self) -> Result<Duration> {
@@ -740,7 +758,14 @@ impl Config {
                 ChannelKind::parse(channel).context("invalid route channel")?;
             }
         }
-        self.poll_interval_dur()?;
+        let poll_active = self.poll_interval_dur()?;
+        let poll_idle = self.poll_idle_interval_dur()?;
+        let poll_max = self.poll_max_interval_dur()?;
+        if poll_active > poll_idle || poll_idle > poll_max {
+            bail!(
+                "poll intervals must satisfy poll_interval <= poll_idle_interval <= poll_max_interval"
+            );
+        }
         self.run_timeout_dur()?;
         Ok(())
     }
@@ -1112,7 +1137,13 @@ fn default_channel() -> String {
     "imessage".to_string()
 }
 fn default_poll_interval() -> String {
-    "3s".to_string()
+    "2s".to_string()
+}
+fn default_poll_idle_interval() -> String {
+    "30s".to_string()
+}
+fn default_poll_max_interval() -> String {
+    "60s".to_string()
 }
 fn default_run_timeout() -> String {
     "10m".to_string()
@@ -1149,6 +1180,8 @@ mod tests {
             primary_delivery: None,
             db_path: root.join("chat.db").to_string_lossy().to_string(),
             poll_interval: "1s".to_string(),
+            poll_idle_interval: "30s".to_string(),
+            poll_max_interval: "60s".to_string(),
             run_timeout: "1s".to_string(),
             self_handles: vec!["me@example.com".to_string()],
             allow_from: Vec::new(),
@@ -1440,5 +1473,29 @@ mod tests {
         assert!(error.to_string().contains("not a symlink"));
         let _ = std::fs::remove_dir_all(assistant);
         let _ = std::fs::remove_dir_all(outside);
+    }
+
+    #[test]
+    fn poll_intervals_must_be_ordered() {
+        let mut cfg = config();
+        cfg.agent = "pi".to_string();
+        cfg.jobs_agent = Some("pi".to_string());
+
+        cfg.poll_interval = "30s".to_string();
+        cfg.poll_idle_interval = "2s".to_string();
+        assert!(cfg
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("poll_interval <= poll_idle_interval <= poll_max_interval"));
+
+        cfg.poll_interval = "2s".to_string();
+        cfg.poll_idle_interval = "30s".to_string();
+        cfg.poll_max_interval = "10s".to_string();
+        assert!(cfg
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("poll_interval <= poll_idle_interval <= poll_max_interval"));
     }
 }

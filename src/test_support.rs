@@ -48,6 +48,8 @@ pub fn test_config() -> crate::config::Config {
         primary_delivery: None,
         db_path: "/fake/chat.db".to_string(),
         poll_interval: "1s".to_string(),
+        poll_idle_interval: "30s".to_string(),
+        poll_max_interval: "60s".to_string(),
         run_timeout: "1s".to_string(),
         self_handles: vec!["me@icloud.com".to_string()],
         allow_from: Vec::new(),
