@@ -1,5 +1,11 @@
 //! Runs the Pi coding agent headlessly for a single message.
 
+/// Long-lived `pi --mode rpc` session. Nothing wires this in yet: PLAN §7 lands
+/// the protocol module first, with no behavior change, then the pool/config
+/// switch. The one-shot `Runner` remains the production path until then.
+#[allow(dead_code)]
+pub(crate) mod rpc;
+
 use std::ffi::OsString;
 use std::time::Duration;
 use std::{io, process::Stdio};
