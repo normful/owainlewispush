@@ -13,6 +13,7 @@ use tracing::{error, info, warn};
 use crate::agent::{Request, RunError, RunOutput, Runner};
 use crate::approval::{Choice, Question};
 use crate::attachments::{DownloadedFile, PreparedFiles, MAX_FILE_BYTES, MAX_FILE_COUNT};
+use crate::config::{AgentBackend, Config};
 use crate::history::{DeliveryStatus, OutboundMessage, OutboundOrigin};
 use crate::image::{PreparedImages, MAX_IMAGE_BYTES, MAX_IMAGE_COUNT};
 use crate::pi::rpc::{UiFuture, UiHandler, UiRequest, UiResponse};
@@ -1230,6 +1231,62 @@ struct BackendTurn<'a> {
     attachment_paths: &'a [PathBuf],
 }
 
+/// The inputs to the `pi --mode rpc` spec builder. Extracted from [`dispatch`]
+/// so the Discord worker and the voice endpoint build byte-identical specs and
+/// cannot drift in prompt, gate, or session handling.
+pub(super) struct RpcSpecInput<'a> {
+    pub session_id: &'a str,
+    pub is_new: bool,
+    pub work_dir: &'a str,
+    pub prompt: &'a ComposedPrompt,
+    pub images: &'a [PathBuf],
+    pub model: Option<&'a str>,
+    pub thinking: Option<&'a str>,
+    /// True when the approval gate should load. The Discord worker passes
+    /// `ctx.cfg.approval_gate_enabled()`; the voice endpoint always passes
+    /// `false` (contract §7).
+    pub gate: bool,
+}
+
+/// Builds one thread's rpc child spec. The only backend with an rpc runner is
+/// Pi, so the binary is resolved from `AgentBackend::Pi` unconditionally. It
+/// takes `&Config` rather than `&Ctx` because the voice endpoint has no
+/// `Channel` and so cannot build a worker `Ctx`.
+pub(super) fn rpc_spec(cfg: &Config, input: RpcSpecInput<'_>) -> crate::pi::PiRpcSpec {
+    let RpcSpecInput {
+        session_id,
+        is_new,
+        work_dir,
+        prompt,
+        images,
+        model,
+        thinking,
+        gate,
+    } = input;
+    crate::pi::PiRpcSpec {
+        bin: cfg.agent_bin(AgentBackend::Pi).to_string(),
+        session_id: session_id.to_string(),
+        is_new,
+        work_dir: work_dir.to_string(),
+        instructions: prompt.instructions.clone(),
+        model: model.map(str::to_string),
+        thinking: thinking.map(str::to_string),
+        images: images.to_vec(),
+        // The gate only loads when tools are configured; an ungated rpc child
+        // can never prompt unexpectedly (PLAN §7).
+        env: if gate {
+            vec![("GATE_TOOLS".to_string(), cfg.approval_gated_tools.join(","))]
+        } else {
+            Vec::new()
+        },
+        extension: if gate {
+            cfg.approval_gate_extension_path()
+        } else {
+            None
+        },
+    }
+}
+
 /// Runs one backend turn: the per-thread rpc pool for `Runner::PiRpc` (PLAN §7
 /// step 2), the one-shot `Runner::run` for every other runner. The audit
 /// events, prompt composition, and session persistence around the call are
@@ -1263,27 +1320,19 @@ async fn dispatch(
             )
             .await;
     }
-    let spec = crate::pi::PiRpcSpec {
-        bin: ctx.cfg.agent_bin(job.backend).to_string(),
-        session_id: session_id.to_string(),
-        is_new,
-        work_dir: work_dir.to_string(),
-        instructions: prompt.instructions.clone(),
-        model: job.model.clone(),
-        thinking: job.thinking.clone(),
-        images: attachment_paths.to_vec(),
-        // The gate only loads when tools are configured; an ungated rpc child
-        // can never prompt unexpectedly (PLAN §7).
-        env: if ctx.cfg.approval_gate_enabled() {
-            vec![(
-                "GATE_TOOLS".to_string(),
-                ctx.cfg.approval_gated_tools.join(","),
-            )]
-        } else {
-            Vec::new()
+    let spec = rpc_spec(
+        &ctx.cfg,
+        RpcSpecInput {
+            session_id,
+            is_new,
+            work_dir,
+            prompt,
+            images: attachment_paths,
+            model: job.model.as_deref(),
+            thinking: job.thinking.as_deref(),
+            gate: ctx.cfg.approval_gate_enabled(),
         },
-        extension: ctx.cfg.approval_gate_extension_path(),
-    };
+    );
     let mut handler = ApprovalHandler {
         ctx,
         job,

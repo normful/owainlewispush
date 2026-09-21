@@ -91,7 +91,59 @@ fn run_checks(cfg: &config::Config) -> CheckReport {
     check_bins(cfg, &mut checks);
     check_voice(cfg, &mut checks);
     check_approval(cfg, &mut checks);
+    check_internal(cfg, &mut checks);
     CheckReport { checks }
+}
+
+/// Reports the voice-bridge endpoint, only when `[internal].listen` is set. The
+/// endpoint is off with no `[internal]` table, so there is nothing to report.
+fn check_internal(cfg: &config::Config, checks: &mut Vec<Check>) {
+    if cfg
+        .internal
+        .as_ref()
+        .and_then(|internal| internal.listen.as_deref())
+        .is_none()
+    {
+        return;
+    }
+    let addr = match cfg.internal_listen_addr() {
+        Ok(Some(addr)) => addr,
+        Ok(None) => return,
+        Err(error) => {
+            checks.push(Check::fail("internal endpoint", error.to_string()));
+            return;
+        }
+    };
+    let token_path = cfg.paths.internal_token.clone();
+    // A stale file with wider permissions is worth surfacing even though startup
+    // rewrites it 0600.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(metadata) = std::fs::metadata(&token_path) {
+            if metadata.permissions().mode() & 0o077 != 0 {
+                checks.push(Check::fail(
+                    "internal endpoint",
+                    format!(
+                        "token file {} is accessible by group or others; Push rewrites it 0600 at startup",
+                        token_path.display()
+                    ),
+                ));
+                return;
+            }
+        }
+    }
+    let mut message = format!(
+        "loopback {addr}, work_dir {}, token {} 0600",
+        cfg.internal_work_dir().display(),
+        token_path.display()
+    );
+    if (3000..=9999).contains(&addr.port()) {
+        message.push_str(
+            "; warning: the port is inside the exe.dev proxy forward range 3000-9999, prefer a port outside it",
+        );
+    }
+    checks.push(Check::pass("internal endpoint", message));
 }
 
 /// Checked from configuration alone: there is no bot token on this VM, so
@@ -570,6 +622,48 @@ mod tests {
         assert!(matches!(checks[0].status, CheckStatus::Pass));
         assert!(checks[0].message.contains("Gemini"));
         assert!(checks[0].message.contains("no key on the VM"));
+    }
+
+    #[test]
+    fn internal_check_is_silent_without_a_listen_address() {
+        let mut checks = Vec::new();
+        check_internal(&test_config(), &mut checks);
+        assert!(checks.is_empty(), "no [internal] table means no check");
+    }
+
+    #[test]
+    fn internal_check_reports_loopback_and_warns_inside_the_proxy_range() {
+        for (listen, expects_warning) in [("127.0.0.1:27317", false), ("127.0.0.1:8000", true)] {
+            let mut cfg = test_config();
+            cfg.internal = Some(crate::config::InternalConfig {
+                listen: Some(listen.to_string()),
+                work_dir: None,
+            });
+            let mut checks = Vec::new();
+            check_internal(&cfg, &mut checks);
+            assert_eq!(checks.len(), 1, "one check for {listen}");
+            assert!(matches!(checks[0].status, CheckStatus::Pass));
+            assert!(checks[0].message.contains("loopback"));
+            assert_eq!(
+                checks[0].message.contains("warning"),
+                expects_warning,
+                "message was {}",
+                checks[0].message
+            );
+        }
+    }
+
+    #[test]
+    fn internal_check_fails_for_a_non_loopback_address() {
+        let mut cfg = test_config();
+        cfg.internal = Some(crate::config::InternalConfig {
+            listen: Some("0.0.0.0:7317".to_string()),
+            work_dir: None,
+        });
+        let mut checks = Vec::new();
+        check_internal(&cfg, &mut checks);
+        assert!(matches!(checks[0].status, CheckStatus::Fail));
+        assert!(checks[0].message.contains("loopback"));
     }
 
     #[test]

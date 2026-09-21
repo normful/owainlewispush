@@ -102,6 +102,10 @@ pub struct GatewayGroup {
     gateways: Vec<Gateway>,
     primary_delivery: Option<PrimaryDeliveryConfig>,
     cfg: Config,
+    /// The voice-bridge turn endpoint, present only when `[internal].listen` is
+    /// set. Built at startup so a bad address or an unwritable token path fails
+    /// the process rather than disappearing into a warning.
+    internal: Option<internal::InternalEndpoint>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -146,6 +150,21 @@ impl GatewayGroup {
         let runners = Arc::new(runners(&cfg));
         let pool = Arc::new(crate::pi::Pool::new(cfg.rpc_pool_config()?));
         let audit_lock = Arc::new(Mutex::new(()));
+        // Voice turns share the pool, store, and pool config, but get their own
+        // audit channel so the always-on surface is not the one with no trail
+        // (contract §9). The audit log is channel-scoped, so `"voice"` replaces
+        // the contract's absent `surface` field.
+        let internal = internal::InternalEndpoint::new(
+            &cfg,
+            store.clone(),
+            pool.clone(),
+            Arc::new(AuditLog::with_lock(
+                cfg.paths.audit.clone(),
+                cfg.audit_log_content,
+                "voice",
+                audit_lock.clone(),
+            )),
+        )?;
         let mut gateways = Vec::with_capacity(enabled.len());
         for spec in enabled {
             gateways.push(Gateway::new_with_shared(
@@ -162,6 +181,7 @@ impl GatewayGroup {
             gateways,
             primary_delivery: cfg.primary_delivery.clone(),
             cfg,
+            internal,
         };
         let destination = group.primary_destination().ok();
         let mut ledger = jobs::Ledger::open(&group.cfg.paths.database)?;
@@ -310,7 +330,7 @@ impl GatewayGroup {
         self.run_until(shutdown_signal()).await
     }
 
-    async fn run_until<S>(self, shutdown: S) -> Result<()>
+    async fn run_until<S>(mut self, shutdown: S) -> Result<()>
     where
         S: Future<Output = ()>,
     {
@@ -323,6 +343,17 @@ impl GatewayGroup {
                 warn!("scheduled jobs disabled: {error:#}");
                 jobs::Scheduler::delivery_only(self.cfg.clone())
             }
+        };
+        // Bind before any channel starts so a bind failure is a startup error
+        // (contract §9); a warning would leave an endpoint nobody can reach.
+        let internal = match self.internal.take() {
+            Some(endpoint) => Some(
+                endpoint
+                    .bind()
+                    .await
+                    .context("start voice bridge endpoint")?,
+            ),
+            None => None,
         };
         let contexts = self
             .gateways
@@ -346,6 +377,14 @@ impl GatewayGroup {
             let receiver = shutdown_rx.clone();
             tokio::spawn(async move { run_pool_janitor(pool, receiver).await })
         });
+        let internal_task = internal.map(|listener| {
+            let receiver = shutdown_rx.clone();
+            tokio::spawn(async move {
+                if let Err(error) = listener.serve(receiver).await {
+                    error!("voice bridge endpoint stopped: {error:#}");
+                }
+            })
+        });
         let mut tasks = JoinSet::new();
         for gateway in self.gateways {
             let channel = gateway.channel.id();
@@ -363,6 +402,10 @@ impl GatewayGroup {
         if let Some(janitor) = janitor {
             janitor.abort();
             let _ = janitor.await;
+        }
+        if let Some(internal) = internal_task {
+            internal.abort();
+            let _ = internal.await;
         }
         match scheduler.await {
             Ok(Ok(())) => {}
@@ -1709,6 +1752,7 @@ async fn shutdown_signal() {
     }
 }
 
+mod internal;
 mod worker;
 
 #[cfg(test)]

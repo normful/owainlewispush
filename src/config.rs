@@ -157,6 +157,10 @@ pub struct Config {
     pub barge_in: bool,
     #[serde(default)]
     pub routes: Vec<RouteRule>,
+    /// Voice-bridge turn endpoint (BRIDGE-PUSH-CONTRACT.md). Absent table means
+    /// the endpoint is disabled.
+    #[serde(default)]
+    pub internal: Option<InternalConfig>,
     /// Canonical root of the single user-owned assistant repository.
     #[serde(default)]
     pub assistant_root: String,
@@ -472,6 +476,46 @@ impl Config {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(std::path::PathBuf::from)
+    }
+
+    /// The loopback address the internal voice-bridge endpoint listens on.
+    /// `Ok(None)` means `[internal].listen` is unset, so the endpoint is off.
+    /// A non-loopback address is rejected here so the endpoint can never bind
+    /// to a proxied interface.
+    pub fn internal_listen_addr(&self) -> Result<Option<std::net::SocketAddr>> {
+        let Some(raw) = self
+            .internal
+            .as_ref()
+            .and_then(|internal| internal.listen.as_deref())
+        else {
+            return Ok(None);
+        };
+        let raw = raw.trim();
+        let addr: std::net::SocketAddr = raw
+            .parse()
+            .with_context(|| format!("invalid internal.listen {raw:?}; expected host:port"))?;
+        if !addr.ip().is_loopback() {
+            bail!("internal.listen must be a loopback address, found {addr}");
+        }
+        Ok(Some(addr))
+    }
+
+    /// The voice workspace. Defaults to a `voice` directory beside `jobs_dir`
+    /// so a voice turn never shares the Discord work_dir (contract §11).
+    pub fn internal_work_dir(&self) -> std::path::PathBuf {
+        if let Some(configured) = self
+            .internal
+            .as_ref()
+            .and_then(|internal| internal.work_dir.as_deref())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            return std::path::PathBuf::from(expand_home(configured));
+        }
+        std::path::Path::new(&self.jobs_dir)
+            .parent()
+            .map(|root| root.join("voice"))
+            .unwrap_or_else(|| std::path::PathBuf::from("voice"))
     }
 
     pub fn agent_backend(&self) -> Result<AgentBackend> {
@@ -928,6 +972,17 @@ impl Config {
                 "poll intervals must satisfy poll_interval <= poll_idle_interval <= poll_max_interval"
             );
         }
+        self.internal_listen_addr()?;
+        if self
+            .internal
+            .as_ref()
+            .and_then(|internal| internal.work_dir.as_deref())
+            .is_some_and(|value| value.trim().is_empty())
+        {
+            bail!(
+                "internal.work_dir cannot be empty; remove it to use the default voice directory"
+            );
+        }
         self.run_timeout_dur()?;
         Ok(())
     }
@@ -1107,6 +1162,20 @@ pub struct RouteRule {
 pub struct PrimaryDeliveryConfig {
     pub channel: String,
     pub target: String,
+}
+
+/// The loopback turn endpoint the voice bridge connects to
+/// (`spikes/voice-bridge/BRIDGE-PUSH-CONTRACT.md`). Unset `listen` disables the
+/// endpoint, which is the behaviour with no `[internal]` table at all.
+#[derive(Debug, Deserialize, Clone, Default, PartialEq, Eq)]
+pub struct InternalConfig {
+    /// Loopback socket address, for example `127.0.0.1:7317`.
+    #[serde(default)]
+    pub listen: Option<String>,
+    /// Voice workspace. Defaults to a `voice/` directory beside `jobs_dir`,
+    /// because voice does not share the Discord work_dir (contract §11).
+    #[serde(default)]
+    pub work_dir: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1352,6 +1421,39 @@ mod tests {
     use super::*;
     use crate::test_support::temp_dir;
 
+    /// Writes a minimal valid config with an `[internal]` table and loads it.
+    fn load_with_internal(listen: &str) -> Result<Config> {
+        let root = temp_dir("config-internal");
+        let assistant = root.join("assistant");
+        std::fs::create_dir_all(&assistant).unwrap();
+        let path = root.join("config.toml");
+        std::fs::write(
+            &path,
+            format!(
+                "channel = \"imessage\"\nagent = \"pi\"\nself_handles = [\"me@example.com\"]\nassistant_root = \"{}\"\n\n[internal]\nlisten = \"{listen}\"\n",
+                assistant.to_string_lossy()
+            ),
+        )
+        .unwrap();
+        Config::load_with_paths(
+            path.to_str().unwrap(),
+            PushPaths::from_root(root.join("runtime")).unwrap(),
+        )
+    }
+
+    #[test]
+    fn internal_listen_parses_and_defaults_the_voice_work_dir() {
+        let cfg = load_with_internal("127.0.0.1:27317").unwrap();
+        assert_eq!(cfg.internal_listen_addr().unwrap().unwrap().port(), 27317);
+        assert!(cfg.internal_work_dir().ends_with("voice"));
+    }
+
+    #[test]
+    fn internal_listen_must_be_loopback() {
+        let error = load_with_internal("0.0.0.0:27317").unwrap_err();
+        assert!(error.to_string().contains("loopback"), "{error}");
+    }
+
     fn config() -> Config {
         let root = temp_dir("config-draft-boundary");
         Config {
@@ -1385,6 +1487,7 @@ mod tests {
             approval_gate_extension: None,
             barge_in: false,
             routes: Vec::new(),
+            internal: None,
             assistant_root: root.to_string_lossy().to_string(),
             jobs_dir: root.join("jobs").to_string_lossy().to_string(),
             jobs_agent: None,

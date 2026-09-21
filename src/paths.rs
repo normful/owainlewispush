@@ -19,6 +19,9 @@ pub struct PushPaths {
     pub jobs_run: PathBuf,
     pub inbox: PathBuf,
     pub cache: PathBuf,
+    /// Per-boot token for the loopback voice-bridge endpoint
+    /// (`spikes/voice-bridge/BRIDGE-PUSH-CONTRACT.md` §4). Written 0600.
+    pub internal_token: PathBuf,
 }
 
 impl PushPaths {
@@ -44,6 +47,7 @@ impl PushPaths {
             jobs_run: root.join("run"),
             inbox: slack_inbox_for_state(&root.join("state.json")),
             cache: root.join("cache"),
+            internal_token: root.join("internal.token"),
             root,
         })
     }
