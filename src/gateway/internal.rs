@@ -227,6 +227,9 @@ async fn handle_connection(ctx: Arc<InternalEndpoint>, stream: TcpStream) -> Res
     let mut ui: Option<mpsc::Receiver<Value>> = None;
     let mut current_id: Option<String> = None;
     let mut current_thread: Option<String> = None;
+    // Signals an in-flight turn to abort in place (contract §6). `None` while no
+    // turn is running; dropped when the turn settles.
+    let mut abort_signal: Option<watch::Sender<bool>> = None;
     // Audio that arrives with no consumer yet; see AUDIO_MAX_BYTES.
     let mut audio = AudioBuffer::default();
 
@@ -257,6 +260,7 @@ async fn handle_connection(ctx: Arc<InternalEndpoint>, stream: TcpStream) -> Res
                             &mut ui,
                             &mut current_id,
                             &mut current_thread,
+                            &mut abort_signal,
                             &frame,
                         )
                         .await
@@ -328,6 +332,7 @@ async fn handle_connection(ctx: Arc<InternalEndpoint>, stream: TcpStream) -> Res
                 let id = current_id.take().unwrap_or_default();
                 let thread = current_thread.take().unwrap_or_default();
                 run = None;
+                abort_signal = None;
                 finish_turn(&ctx, &mut sink, &id, &thread, outcome).await;
             }
         }
@@ -348,6 +353,7 @@ async fn handle_control<S>(
     ui: &mut Option<mpsc::Receiver<Value>>,
     current_id: &mut Option<String>,
     current_thread: &mut Option<String>,
+    abort_signal: &mut Option<watch::Sender<bool>>,
     frame: &Value,
 ) -> bool
 where
@@ -397,23 +403,12 @@ where
                 ui,
                 current_id,
                 current_thread,
+                abort_signal,
                 frame,
             )
             .await
         }
-        "cancel" => {
-            cancel_turn(
-                ctx,
-                sink,
-                run,
-                deltas,
-                ui,
-                current_id,
-                current_thread,
-                frame,
-            )
-            .await
-        }
+        "cancel" => cancel_turn(sink, current_id, abort_signal, frame).await,
         other => {
             send_json(
                 sink,
@@ -437,6 +432,7 @@ async fn start_turn<S>(
     ui: &mut Option<mpsc::Receiver<Value>>,
     current_id: &mut Option<String>,
     current_thread: &mut Option<String>,
+    abort_signal: &mut Option<watch::Sender<bool>>,
     frame: &Value,
 ) -> bool
 where
@@ -548,14 +544,18 @@ where
     let pool = ctx.pool.clone();
     let timeout = ctx.run_timeout;
     let key = thread.to_string();
+    // `cancel` flips this to `true`; the pool asks Pi to abort in place and,
+    // once the child settles, keeps it for the next turn (contract §6).
+    let (abort_tx, abort_rx) = watch::channel(false);
     let future: TurnFuture = Box::pin(async move {
-        pool.run(
+        pool.run_abortable(
             &key,
             spec,
             &prompt.content,
             timeout,
             &mut handler,
             Some(&delta_tx),
+            Some(abort_rx),
         )
         .await
     });
@@ -565,18 +565,19 @@ where
     *ui = Some(ui_rx);
     *current_id = Some(id.to_string());
     *current_thread = Some(thread.to_string());
+    *abort_signal = Some(abort_tx);
     true
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Signals the in-flight turn to abort. The pool sends Pi's graceful `abort`
+/// and, once the child settles, returns it to the pool, so the next turn reuses
+/// it (contract §6). The single `cancelled` frame and the audit record are
+/// emitted by `finish_turn` when the run settles, so a cancel cannot race its
+/// own terminal frame.
 async fn cancel_turn<S>(
-    ctx: &InternalEndpoint,
     sink: &mut S,
-    run: &mut Option<TurnFuture>,
-    deltas: &mut Option<mpsc::Receiver<Delta>>,
-    ui: &mut Option<mpsc::Receiver<Value>>,
-    current_id: &mut Option<String>,
-    current_thread: &mut Option<String>,
+    current_id: &Option<String>,
+    abort_signal: &mut Option<watch::Sender<bool>>,
     frame: &Value,
 ) -> bool
 where
@@ -594,34 +595,10 @@ where
         )
         .await;
     }
-    let id = current_id.clone().unwrap_or_default();
-    let thread = current_thread.clone().unwrap_or_default();
-    // Dropping the run future is the whole cancellation: it drops the child,
-    // whose `kill_on_drop` reaps it, and the pool's `RunGuard` clears the
-    // thread entry so the next turn respawns and resumes with `--session`
-    // (contract §6). `Pool::run` does not expose the per-turn `Session`, so the
-    // graceful `abort` message cannot be sent; the handler never parks on a
-    // dialog, so there is no outstanding UI request to answer first either.
-    *run = None;
-    *deltas = None;
-    *ui = None;
-    *current_id = None;
-    *current_thread = None;
-    record(
-        &ctx.audit,
-        ctx.audit.failed(
-            "voice_turn_cancelled",
-            0,
-            &thread,
-            Some(AgentBackend::Pi),
-            "cancelled by the bridge",
-        ),
-    );
-    send_json(
-        sink,
-        json!({"type": "cancelled", "v": PROTOCOL_VERSION, "id": id}),
-    )
-    .await
+    if let Some(abort) = abort_signal.as_ref() {
+        let _ = abort.send(true);
+    }
+    true
 }
 
 /// Sends the terminal frame for a settled run and records it in the audit log.
@@ -659,6 +636,23 @@ async fn finish_turn<S>(
                     "id": id,
                     "text": output.reply,
                 }),
+            )
+            .await;
+        }
+        Err(RunError::Cancelled) => {
+            record(
+                &ctx.audit,
+                ctx.audit.failed(
+                    "voice_turn_cancelled",
+                    0,
+                    thread,
+                    Some(AgentBackend::Pi),
+                    "cancelled by the bridge",
+                ),
+            );
+            send_json(
+                sink,
+                json!({"type": "cancelled", "v": PROTOCOL_VERSION, "id": id}),
             )
             .await;
         }
@@ -741,6 +735,9 @@ fn error_class(error: &RunError) -> &'static str {
         RunError::SessionMissing(_) => "pi",
         RunError::Failed(message) if message.to_lowercase().contains("spawn") => "spawn",
         RunError::Failed(_) => "pi",
+        // `finish_turn` intercepts `Cancelled` before it reaches here; this arm
+        // exists only so the match stays exhaustive.
+        RunError::Cancelled => "cancelled",
     }
 }
 
@@ -748,6 +745,7 @@ fn error_message(error: &RunError) -> String {
     match error {
         RunError::Timeout => "Pi turn timed out".to_string(),
         RunError::SessionMissing(message) | RunError::Failed(message) => message.clone(),
+        RunError::Cancelled => "Pi turn cancelled".to_string(),
     }
 }
 

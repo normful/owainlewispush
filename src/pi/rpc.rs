@@ -36,11 +36,16 @@ use anyhow::{Context, Result};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 /// Malformed lines tolerated before a run is declared broken, so a hostile or
 /// corrupt stream cannot spin the read loop forever.
 const MAX_SKIPPED_LINES: usize = 100;
+
+/// How long an aborted turn may take to settle before its child is declared
+/// unusable. Real `pi 0.86.1` settles in ~15 ms; this is a generous bound, not
+/// a timeout a healthy child ever sees.
+const ABORT_SETTLE_GRACE: Duration = Duration::from_secs(5);
 
 /// Bytes of stderr kept for error classification. pi reports a missing
 /// `--session` on stderr before exiting; stdout (the protocol stream) is silent.
@@ -197,7 +202,23 @@ pub struct TurnOutcome {
     pub delta_chars: usize,
     /// Extension-UI requests the host answered during the turn.
     pub ui_requests: Vec<UiRequest>,
+    /// True when the turn was cancelled on request and settled cleanly, so the
+    /// child is idle and reusable. `text` is empty in that case.
+    pub cancelled: bool,
 }
+
+/// A cancelled turn that did not settle within [`ABORT_SETTLE_GRACE`], so the
+/// child is in an unknown state and must be discarded rather than reused.
+#[derive(Debug)]
+pub(crate) struct AbortUnsettled;
+
+impl std::fmt::Display for AbortUnsettled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "pi rpc turn aborted but did not settle")
+    }
+}
+
+impl std::error::Error for AbortUnsettled {}
 
 /// A live `pi --mode rpc` child with its protocol streams.
 pub struct Session {
@@ -336,6 +357,38 @@ impl Session {
         handler: &mut dyn UiHandler,
         delta_sink: Option<&mpsc::Sender<Delta>>,
     ) -> Result<TurnOutcome> {
+        self.turn_abortable(prompt, timeout, handler, delta_sink, None)
+            .await
+    }
+
+    /// [`Session::turn`] with an optional cancellation signal. When `abort`
+    /// flips to `true`, Pi's graceful `{"type":"abort"}` is sent and the loop
+    /// keeps draining the stream until the run settles (`agent_settled`), so
+    /// the child stays idle and reusable; the outcome then carries
+    /// `cancelled: true` and an empty `text`. If it does not settle within
+    /// [`ABORT_SETTLE_GRACE`] the caller must discard the child
+    /// ([`AbortUnsettled`]). Verified against real `pi 0.86.1`: abort emits
+    /// `message_end stopReason=aborted`, `turn_end`, `agent_end`,
+    /// `agent_settled`, and `response command=abort`, and the same child
+    /// accepts the next prompt.
+    pub async fn turn_abortable(
+        &mut self,
+        prompt: &str,
+        timeout: Duration,
+        handler: &mut dyn UiHandler,
+        delta_sink: Option<&mpsc::Sender<Delta>>,
+        mut abort: Option<watch::Receiver<bool>>,
+    ) -> Result<TurnOutcome> {
+        // A cancel that arrived before the prompt was sent needs no protocol
+        // work: the child never started this turn, so it is already reusable.
+        if abort_already(&abort) {
+            return Ok(TurnOutcome {
+                text: String::new(),
+                delta_chars: 0,
+                ui_requests: Vec::new(),
+                cancelled: true,
+            });
+        }
         self.send(&json!({"type": "prompt", "message": prompt}))
             .await?;
         let mut skipped = 0usize;
@@ -344,13 +397,41 @@ impl Session {
         let mut ui_requests = Vec::new();
         let mut last_message_end: Option<String> = None;
         let mut asked_for_final = false;
+        let mut aborted = false;
+        let mut grace: Option<tokio::time::Instant> = None;
         let deadline = tokio::time::Instant::now() + timeout;
 
         let result = loop {
-            let event = match tokio::time::timeout_at(deadline, self.read_event()).await {
-                Err(_) => break Err(anyhow::anyhow!("pi rpc turn timed out")),
-                Ok(Err(error)) => break Err(error),
-                Ok(Ok(event)) => event,
+            let wait_until = grace.unwrap_or(deadline);
+            let wake = {
+                // The read future borrows `self`; it is dropped at the end of
+                // this block, before any branch below touches `self` again.
+                let read = self.read_event();
+                tokio::pin!(read);
+                tokio::select! {
+                    biased;
+                    _ = abort_requested(&mut abort, aborted) => Wake::Abort,
+                    _ = tokio::time::sleep_until(wait_until) => Wake::Deadline,
+                    read = &mut read => Wake::Event(read),
+                }
+            };
+            let event = match wake {
+                Wake::Abort => {
+                    aborted = true;
+                    if self
+                        .send(&json!({"type": "abort", "id": "push-abort"}))
+                        .await
+                        .is_err()
+                    {
+                        break Err(anyhow::anyhow!("pi rpc closed as the turn was aborted"));
+                    }
+                    grace = Some(tokio::time::Instant::now() + ABORT_SETTLE_GRACE);
+                    continue;
+                }
+                Wake::Deadline if aborted => break Err(AbortUnsettled.into()),
+                Wake::Deadline => break Err(anyhow::anyhow!("pi rpc turn timed out")),
+                Wake::Event(Ok(event)) => event,
+                Wake::Event(Err(error)) => break Err(error),
             };
             let value = match event {
                 Event::Eof => break Err(anyhow::anyhow!("pi rpc closed during the run")),
@@ -382,9 +463,14 @@ impl Session {
                             .and_then(Value::as_str)
                         {
                             delta_chars += delta.chars().count();
-                            if let Some(sink) = delta_sink {
-                                pending.push_str(delta);
-                                emit_sentences(&mut pending, sink);
+                            // A cancelled turn has no consumer for its text;
+                            // keeping the relay silent avoids frames for a turn
+                            // the bridge already gave up on.
+                            if !aborted {
+                                if let Some(sink) = delta_sink {
+                                    pending.push_str(delta);
+                                    emit_sentences(&mut pending, sink);
+                                }
                             }
                         }
                     }
@@ -441,6 +527,14 @@ impl Session {
                     self.send(&response.wire(request.id())).await?;
                 }
                 "agent_settled" => {
+                    if aborted {
+                        break Ok(TurnOutcome {
+                            text: String::new(),
+                            delta_chars,
+                            ui_requests,
+                            cancelled: true,
+                        });
+                    }
                     if !asked_for_final {
                         asked_for_final = true;
                         self.send(&json!({"type": "get_last_assistant_text", "id": "push-final"}))
@@ -471,6 +565,7 @@ impl Session {
                         text,
                         delta_chars,
                         ui_requests,
+                        cancelled: false,
                     });
                 }
                 "extension_error" => {
@@ -479,6 +574,11 @@ impl Session {
                 _ => {}
             }
         };
+        // Once aborted, any failure (EOF, a broken pipe, the grace elapsing) is
+        // a cancellation whose child is unusable — not a generic run failure.
+        if aborted && result.is_err() {
+            return Err(AbortUnsettled.into());
+        }
         result
     }
 
@@ -504,6 +604,42 @@ enum Event {
     Value(Value),
     Malformed(String),
     Eof,
+}
+
+/// Which arm of the turn loop's `select!` fired.
+enum Wake {
+    /// A protocol event arrived (or the stream ended / errored).
+    Event(Result<Event>),
+    /// The caller asked to cancel.
+    Abort,
+    /// The turn timeout, or the abort grace, elapsed.
+    Deadline,
+}
+
+/// True when the cancel signal is already set. Non-blocking: used before a
+/// turn starts, where parking would deadlock a run that was never abortable.
+fn abort_already(abort: &Option<watch::Receiver<bool>>) -> bool {
+    abort.as_ref().is_some_and(|rx| *rx.borrow())
+}
+
+/// Resolves when the caller asks to cancel. Never resolves without a signal, so
+/// it parks a `select!` branch rather than spinning. Once `already` is true the
+/// signal has been consumed and the branch stays parked, so the abort is sent
+/// exactly once.
+async fn abort_requested(abort: &mut Option<watch::Receiver<bool>>, already: bool) -> bool {
+    if already {
+        std::future::pending::<()>().await;
+        return false;
+    }
+    let Some(rx) = abort.as_mut() else {
+        std::future::pending::<()>().await;
+        return false;
+    };
+    if *rx.borrow() {
+        return true;
+    }
+    let _ = rx.changed().await;
+    *rx.borrow()
 }
 
 /// Extracts the concatenated `text` parts of an assistant `message_end` event.

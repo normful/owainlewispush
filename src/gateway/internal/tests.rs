@@ -370,18 +370,40 @@ async fn a_second_turn_while_busy_is_rejected() {
     h.stop().await;
 }
 
-/// 5. `cancel` mid-turn -> `cancelled`; the run future is dropped, so the next
-/// turn on the same thread succeeds (proves `RunGuard` recovery).
+/// 5. `cancel` mid-turn -> `cancelled`, and the cancellation is graceful: Pi's
+/// `abort` is sent, the child settles, and the next turn on the same thread
+/// **reuses the same child** (one spawn across both turns) instead of
+/// respawning. The fake backgrounds its turn so it can answer `abort` while the
+/// prompt is still "running", matching real `pi`'s concurrency.
 #[tokio::test]
-async fn cancel_stops_the_turn_and_the_thread_recovers() {
-    let h = start(&fake_rpc(
-        &temp_dir("internal-t5-args").join("args"),
-        &temp_dir("internal-t5-env").join("env"),
-        "sess-1",
-        "1",
-        false,
-    ))
-    .await;
+async fn cancel_aborts_in_place_and_the_thread_recovers() {
+    let root = temp_dir("internal-t5");
+    let spawn_marker = root.join("spawns");
+    let script = format!(
+        r#"#!/bin/sh
+printf 'x' >> {marker}
+while IFS= read -r line; do
+  case "$line" in
+    *"get_state"*)
+      printf '%s\n' '{{"type":"response","command":"get_state","id":"push-state","data":{{"sessionId":"sess-1","model":{{"id":"m"}},"thinkingLevel":"high"}}}}'
+      ;;
+    *"get_last_assistant_text"*)
+      printf '%s\n' '{{"type":"response","command":"get_last_assistant_text","id":"push-final","data":{{"text":"One. Two."}}}}'
+      ;;
+    *'"type":"prompt"'*)
+      ( sleep 1
+        printf '%s\n' '{{"type":"message_update","assistantMessageEvent":{{"type":"text_delta","delta":"One. "}}}}'
+        printf '%s\n' '{{"type":"agent_settled"}}' ) &
+      ;;
+    *'"type":"abort"'*)
+      printf '%s\n' '{{"type":"agent_settled"}}'
+      ;;
+  esac
+done
+"#,
+        marker = sh_arg(&spawn_marker),
+    );
+    let h = start(&script).await;
     let mut socket = open(&h).await;
     write_json(
         &mut socket,
@@ -396,10 +418,13 @@ async fn cancel_stops_the_turn_and_the_thread_recovers() {
         if frame["type"] == "cancelled" {
             break frame;
         }
+        // The abort settles the turn; no `delta` may arrive for it, and no
+        // `done` may either.
+        assert_ne!(frame["type"], "done", "a cancelled turn must not `done`");
     };
     assert_eq!(cancelled["id"], "c1");
 
-    // The next turn respawns a child and resumes the stored session.
+    // The next turn reuses the same child (no respawn) and resumes the session.
     write_json(
         &mut socket,
         json!({"type": "turn", "v": 1, "id": "c2", "thread": "voice:desk", "text": "again"}),
@@ -413,6 +438,11 @@ async fn cancel_stops_the_turn_and_the_thread_recovers() {
     };
     assert_eq!(done["id"], "c2");
     assert!(!done["text"].as_str().unwrap().is_empty());
+    assert_eq!(
+        std::fs::read_to_string(&spawn_marker).unwrap(),
+        "x",
+        "abort must be in place: the child is reused, not respawned"
+    );
     h.stop().await;
 }
 

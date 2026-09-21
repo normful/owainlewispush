@@ -2988,6 +2988,12 @@ failure precisely. End with exactly one final line: VERDICT: PASS or VERDICT: FA
             result: None,
             error: Some(format!("evaluator backend: {error}")),
         },
+        // Evaluators are never abortable runs; the variant is unreachable here.
+        Err(RunError::Cancelled) => EvaluationOutcome {
+            state: "error",
+            result: None,
+            error: Some("evaluator cancelled".to_string()),
+        },
     }
 }
 
@@ -3065,6 +3071,8 @@ async fn execute(cfg: &Config, job: &Job) -> std::result::Result<String, Executi
         Err(RunError::Failed(error) | RunError::SessionMissing(error)) => {
             Err(ExecutionError::Failed(format!("backend: {error}")))
         }
+        // Jobs are never abortable runs; the variant is unreachable here.
+        Err(RunError::Cancelled) => Err(ExecutionError::Failed("backend: cancelled".to_string())),
     }
 }
 

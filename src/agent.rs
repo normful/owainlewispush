@@ -36,6 +36,10 @@ pub enum RunError {
     Timeout,
     SessionMissing(String),
     Failed(String),
+    /// The run was aborted on request and settled cleanly. Only the abortable
+    /// pool path produces it (`Pool::run_abortable`); the one-shot runners and
+    /// the Discord worker never do. The child is reusable, unlike a crash.
+    Cancelled,
 }
 
 pub(crate) fn final_reply(backend: &str, reply: &str) -> Result<String, RunError> {

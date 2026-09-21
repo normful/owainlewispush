@@ -17,6 +17,11 @@
 //!   the next turn on that thread spawns a fresh child and resumes it with
 //!   `--session <id>`, exactly the crash contract in DESIGN §4.
 //!
+//! [`Pool::run_abortable`] is the graceful alternative: a cancel signal makes
+//! the turn send Pi's `abort` and settle, and the child is **returned to the
+//! pool** so the next turn reuses it instead of respawning. The voice-bridge
+//! endpoint uses it; the Discord worker does not (it still drops the future).
+//!
 //! An entry with `session: None` is a thread whose run is in flight; idle
 //! eviction and the cap skip it, so neither can pull the child out from under a
 //! parked approval or a running turn.
@@ -26,9 +31,11 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use tokio::sync::watch;
+
 use crate::agent::{final_reply, RunError, RunOutput};
 
-use super::rpc::{Session, UiHandler};
+use super::rpc::{AbortUnsettled, Session, UiHandler};
 
 /// Static limits for a pool, resolved once from `[agent]` config.
 #[derive(Debug, Clone, Copy)]
@@ -110,6 +117,28 @@ impl Pool {
         handler: &mut dyn UiHandler,
         delta_sink: Option<&tokio::sync::mpsc::Sender<super::rpc::Delta>>,
     ) -> Result<RunOutput, RunError> {
+        self.run_abortable(key, spec, prompt, timeout, handler, delta_sink, None)
+            .await
+    }
+
+    /// [`Pool::run`] with an optional cancel signal. On abort the child is
+    /// asked to abort gracefully and, when it settles, returned to the pool so
+    /// the next turn on this thread **reuses the same child** instead of paying
+    /// a respawn; a child that does not settle is discarded. Either way the run
+    /// reports [`RunError::Cancelled`], never a generic failure.
+    // The signature is `run` plus one argument; splitting it would only hide the
+    // parallel.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn run_abortable(
+        &self,
+        key: &str,
+        spec: PiRpcSpec,
+        prompt: &str,
+        timeout: Duration,
+        handler: &mut dyn UiHandler,
+        delta_sink: Option<&tokio::sync::mpsc::Sender<super::rpc::Delta>>,
+        abort: Option<watch::Receiver<bool>>,
+    ) -> Result<RunOutput, RunError> {
         let (mut session, session_id) = self.acquire(key, &spec, timeout).await?;
         // The guard forgets this thread's entry if the run future is dropped
         // (interrupt/task abort) before the turn settles.
@@ -119,15 +148,31 @@ impl Pool {
             armed: true,
         };
 
-        let outcome = match session.turn(prompt, timeout, handler, delta_sink).await {
+        let outcome = match session
+            .turn_abortable(prompt, timeout, handler, delta_sink, abort)
+            .await
+        {
             Ok(outcome) => outcome,
             Err(error) => {
                 guard.armed = false;
                 self.discard(key);
                 drop(session);
+                // An unsettled abort is still a cancellation to the caller; the
+                // child is dropped because its state is unknown.
+                if error.downcast_ref::<AbortUnsettled>().is_some() {
+                    return Err(RunError::Cancelled);
+                }
                 return Err(classify(error));
             }
         };
+        if outcome.cancelled {
+            // The child settled and is idle, so return it to the pool rather
+            // than letting the `RunGuard` forget it. The next turn on this
+            // thread then reuses it.
+            guard.armed = false;
+            self.release(key, session, session_id);
+            return Err(RunError::Cancelled);
+        }
         let reply = match final_reply("pi", &outcome.text) {
             Ok(reply) => reply,
             Err(error) => {
@@ -618,5 +663,134 @@ done
             .await
             .unwrap_err();
         assert!(matches!(error, RunError::SessionMissing(_)));
+    }
+
+    /// A fake `pi` that backgrounds its turn so it can answer `abort` while the
+    /// prompt is still "running" (real pi is concurrent), and appends a spawn
+    /// marker once per child.
+    fn fake_abortable(marker: &std::path::Path, settle_on_abort: bool) -> String {
+        // With `settle_on_abort` the fake answers `abort` and settles its turn;
+        // without it the turn never settles, so the abort grace elapses.
+        let abort_case = if settle_on_abort {
+            r#"*'"type":"abort"'*) printf '%s\n' '{"type":"agent_settled"}' ;;"#
+        } else {
+            ""
+        };
+        let prompt_case = if settle_on_abort {
+            r#"( sleep 2; printf '%s\n' '{"type":"agent_settled"}' ) &"#
+        } else {
+            "( sleep 60 ) &"
+        };
+        format!(
+            r#"#!/bin/sh
+printf 'x' >> {marker}
+while IFS= read -r line; do
+  case "$line" in
+    *"get_state"*)
+      printf '%s\n' '{{"type":"response","command":"get_state","id":"push-state","data":{{"sessionId":"sess-1","model":{{"id":"m"}},"thinkingLevel":"high"}}}}'
+      ;;
+    *"get_last_assistant_text"*)
+      printf '%s\n' '{{"type":"response","command":"get_last_assistant_text","id":"push-final","data":{{"text":"reply"}}}}'
+      ;;
+    *'"type":"prompt"'*)
+      {prompt_case}
+      ;;
+    {abort_case}
+  esac
+done
+"#,
+            marker = sh_arg(marker),
+        )
+    }
+
+    fn signalling_abort() -> (watch::Sender<bool>, watch::Receiver<bool>) {
+        watch::channel(false)
+    }
+
+    /// A graceful abort returns `Cancelled` and keeps the settled child, so the
+    /// next turn reuses it instead of paying a respawn.
+    #[tokio::test]
+    async fn abort_in_place_keeps_the_child_for_the_next_turn() {
+        let marker = temp_path("pool-abort-marker");
+        let cli = FakeCli::new("pi", &fake_abortable(&marker, true));
+        let work_dir = crate::test_support::temp_dir("pool-abort-work");
+        let pool = Arc::new(Pool::new(PoolConfig::default()));
+        let dir = work_dir.to_str().unwrap();
+
+        let (tx, rx) = signalling_abort();
+        let signal = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let _ = tx.send(true);
+        });
+        let first = pool
+            .run_abortable(
+                "thread-a",
+                spec(&cli.bin(), true, "", dir),
+                "one",
+                Duration::from_secs(5),
+                &mut CancelHandler,
+                None,
+                Some(rx),
+            )
+            .await;
+        signal.await.unwrap();
+        assert!(matches!(first, Err(RunError::Cancelled)), "got {first:?}");
+        assert_eq!(
+            pool.live_sessions(),
+            1,
+            "the settled child stays in the pool"
+        );
+
+        let second = pool
+            .run(
+                "thread-a",
+                spec(&cli.bin(), false, "sess-1", dir),
+                "two",
+                Duration::from_secs(5),
+                &mut CancelHandler,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(second.reply, "reply");
+        assert_eq!(
+            std::fs::read_to_string(&marker).unwrap(),
+            "x",
+            "one spawn across both turns proves abort in place"
+        );
+    }
+
+    /// A child that never settles after `abort` is reported as `Cancelled` (not
+    /// a generic failure) and discarded, because its state is unknown.
+    #[tokio::test]
+    async fn an_unsettled_abort_discards_the_child() {
+        let marker = temp_path("pool-abort-stuck-marker");
+        let cli = FakeCli::new("pi", &fake_abortable(&marker, false));
+        let work_dir = crate::test_support::temp_dir("pool-abort-stuck-work");
+        let pool = Arc::new(Pool::new(PoolConfig::default()));
+        let dir = work_dir.to_str().unwrap();
+
+        let (tx, rx) = signalling_abort();
+        let signal = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let _ = tx.send(true);
+        });
+        let outcome = pool
+            .run_abortable(
+                "thread-a",
+                spec(&cli.bin(), true, "", dir),
+                "one",
+                Duration::from_secs(30),
+                &mut CancelHandler,
+                None,
+                Some(rx),
+            )
+            .await;
+        signal.await.unwrap();
+        assert!(
+            matches!(outcome, Err(RunError::Cancelled)),
+            "got {outcome:?}"
+        );
+        assert_eq!(pool.live_sessions(), 0, "an unsettled child is discarded");
     }
 }

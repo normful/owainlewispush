@@ -542,7 +542,7 @@ where
             )
             .await;
         }
-        None => {
+        None | Some(Err(RunError::Cancelled)) => {
             warn!("[{}] {} run interrupted", job.thread, runner.label());
             audit(
                 ctx,

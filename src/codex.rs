@@ -696,6 +696,7 @@ sleep 2
             RunError::Failed(msg) => assert_eq!(msg, expected),
             RunError::Timeout => panic!("expected failed error, got timeout"),
             RunError::SessionMissing(msg) => panic!("unexpected missing session: {msg}"),
+            RunError::Cancelled => panic!("unexpected cancellation"),
         }
     }
 
@@ -704,6 +705,7 @@ sleep 2
             RunError::Timeout => {}
             RunError::Failed(msg) => panic!("expected timeout, got failed: {msg}"),
             RunError::SessionMissing(msg) => panic!("unexpected missing session: {msg}"),
+            RunError::Cancelled => panic!("unexpected cancellation"),
         }
     }
 

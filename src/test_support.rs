@@ -214,6 +214,7 @@ pub async fn assert_runner_contract(contract: RunnerContract) {
                 contract.name
             )
         }
+        Err(RunError::Cancelled) => panic!("{} failed run was cancelled", contract.name),
         Ok(_) => panic!("{} failed run succeeded", contract.name),
     }
 
@@ -229,6 +230,7 @@ pub async fn assert_runner_contract(contract: RunnerContract) {
         Err(RunError::SessionMissing(msg)) => {
             panic!("{} timeout reported missing session: {msg}", contract.name)
         }
+        Err(RunError::Cancelled) => panic!("{} timeout run was cancelled", contract.name),
         Ok(_) => panic!("{} timeout run succeeded", contract.name),
     }
 }
