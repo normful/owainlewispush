@@ -628,16 +628,27 @@ async fn finish_turn<S>(
             {
                 warn!("[{}] voice session save failed: {error}", thread);
             }
-            send_json(
-                sink,
-                json!({
-                    "type": "done",
-                    "v": PROTOCOL_VERSION,
-                    "id": id,
-                    "text": output.reply,
-                }),
-            )
-            .await;
+            let mut frame = json!({
+                "type": "done",
+                "v": PROTOCOL_VERSION,
+                "id": id,
+                "text": output.reply,
+            });
+            // Pi reports its own session tokens/cost; they cover the agent's
+            // model calls, which the bridge cannot see. `cumulative: true` marks
+            // them as session totals, not this turn's.
+            if let Some(usage) = &output.usage {
+                frame["usage"] = json!({
+                    "input": usage.input,
+                    "output": usage.output,
+                    "cache_read": usage.cache_read,
+                    "cache_write": usage.cache_write,
+                    "total": usage.total,
+                    "cost_usd": usage.cost_micros as f64 / 1_000_000.0,
+                    "cumulative": true,
+                });
+            }
+            send_json(sink, frame).await;
         }
         Err(RunError::Cancelled) => {
             record(

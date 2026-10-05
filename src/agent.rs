@@ -7,6 +7,7 @@ use std::time::Duration;
 use uuid::Uuid;
 
 use crate::config::{AgentBackend, Config};
+use crate::pi::rpc::PiUsage;
 use crate::{claude, codex, pi};
 
 /// One headless agent turn.
@@ -28,6 +29,9 @@ pub struct Request<'a> {
 pub struct RunOutput {
     pub reply: String,
     pub session_id: Option<String>,
+    /// Pi's own token usage and cost for its session, when it reported them.
+    /// Other backends leave this `None`.
+    pub usage: Option<PiUsage>,
 }
 
 /// What went wrong, separated so the gateway can phrase timeouts differently.
@@ -251,6 +255,7 @@ impl FakeRunner {
                 current_message.as_deref().unwrap_or(req.prompt)
             ),
             session_id: req.is_new.then(|| self.session_id.clone()),
+            usage: None,
         })
     }
 }

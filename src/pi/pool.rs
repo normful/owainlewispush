@@ -190,6 +190,7 @@ impl Pool {
         Ok(RunOutput {
             reply,
             session_id: spec.is_new.then_some(session_id),
+            usage: outcome.usage,
         })
     }
 

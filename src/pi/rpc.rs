@@ -193,6 +193,43 @@ fn sentence_boundary(text: &str) -> Option<usize> {
     None
 }
 
+/// Parses Pi's `get_session_stats` response into [`PiUsage`].
+///
+/// `None` when the shape is unexpected (a custom Pi build), so a missing stat
+/// degrades to "no cost reported" rather than failing the turn.
+fn parse_session_stats(value: &Value) -> Option<PiUsage> {
+    let tokens = value.pointer("/data/tokens")?;
+    let number = |name: &str| tokens.get(name).and_then(Value::as_u64).unwrap_or(0);
+    let cost = value
+        .pointer("/data/cost")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0);
+    Some(PiUsage {
+        input: number("input"),
+        output: number("output"),
+        cache_read: number("cacheRead"),
+        cache_write: number("cacheWrite"),
+        total: number("total"),
+        // Nearest micro-USD, clamped so a wild value cannot wrap the cast.
+        cost_micros: (cost.max(0.0) * 1_000_000.0).round().min(u64::MAX as f64) as u64,
+    })
+}
+
+/// Token usage and cost Pi reports for its session (`get_session_stats`).
+///
+/// Pi reports **session-cumulative** totals, not per-turn ones, so a consumer
+/// that wants a per-turn figure must diff consecutive reports. `cost` is kept in
+/// millionths of a USD so the struct stays `Eq`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PiUsage {
+    pub input: u64,
+    pub output: u64,
+    pub cache_read: u64,
+    pub cache_write: u64,
+    pub total: u64,
+    pub cost_micros: u64,
+}
+
 /// One completed rpc turn.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TurnOutcome {
@@ -205,6 +242,8 @@ pub struct TurnOutcome {
     /// True when the turn was cancelled on request and settled cleanly, so the
     /// child is idle and reusable. `text` is empty in that case.
     pub cancelled: bool,
+    /// Pi's own session usage, when it answered `get_session_stats`.
+    pub usage: Option<PiUsage>,
 }
 
 /// A cancelled turn that did not settle within [`ABORT_SETTLE_GRACE`], so the
@@ -387,6 +426,7 @@ impl Session {
                 delta_chars: 0,
                 ui_requests: Vec::new(),
                 cancelled: true,
+                usage: None,
             });
         }
         self.send(&json!({"type": "prompt", "message": prompt}))
@@ -396,6 +436,7 @@ impl Session {
         let mut pending = String::new();
         let mut ui_requests = Vec::new();
         let mut last_message_end: Option<String> = None;
+        let mut usage: Option<PiUsage> = None;
         let mut asked_for_final = false;
         let mut aborted = false;
         let mut grace: Option<tokio::time::Instant> = None;
@@ -533,13 +574,25 @@ impl Session {
                             delta_chars,
                             ui_requests,
                             cancelled: true,
+                            usage: None,
                         });
                     }
                     if !asked_for_final {
                         asked_for_final = true;
+                        // Stats first: Pi answers requests in order, so this
+                        // response lands before `get_last_assistant_text`, which
+                        // is the frame that ends the turn.
+                        self.send(&json!({"type": "get_session_stats", "id": "push-stats"}))
+                            .await?;
                         self.send(&json!({"type": "get_last_assistant_text", "id": "push-final"}))
                             .await?;
                     }
+                }
+                "response"
+                    if value.get("command").and_then(Value::as_str)
+                        == Some("get_session_stats") =>
+                {
+                    usage = parse_session_stats(&value);
                 }
                 "response"
                     if value.get("command").and_then(Value::as_str)
@@ -566,6 +619,7 @@ impl Session {
                         delta_chars,
                         ui_requests,
                         cancelled: false,
+                        usage,
                     });
                 }
                 "extension_error" => {
@@ -727,6 +781,79 @@ done
 
     fn spam() -> String {
         FAKE.to_string()
+    }
+
+    /// A fake `pi --mode rpc` that also answers `get_session_stats`, so the turn
+    /// reports Pi's own tokens and cost.
+    const FAKE_WITH_STATS: &str = r#"#!/bin/sh
+while IFS= read -r line; do
+  case "$line" in
+    *"get_state"*)
+      printf '%s\n' '{"type":"response","command":"get_state","id":"push-state","data":{"sessionId":"sess-1","model":{"id":"m"},"thinkingLevel":"high"}}'
+      ;;
+    *"get_session_stats"*)
+      printf '%s\n' '{"type":"response","command":"get_session_stats","id":"push-stats","data":{"tokens":{"input":1200,"output":300,"cacheRead":4000,"cacheWrite":50,"total":5550},"cost":0.0123456}}'
+      ;;
+    *"get_last_assistant_text"*)
+      printf '%s\n' '{"type":"response","command":"get_last_assistant_text","id":"push-final","data":{"text":"hello from gate"}}'
+      ;;
+    *'"type":"prompt"'*)
+      printf '%s\n' '{"type":"agent_settled"}'
+      ;;
+    *) ;;
+  esac
+done
+"#;
+
+    #[tokio::test]
+    async fn turn_reports_pi_session_usage_and_cost() {
+        let cli = FakeCli::new("rpc-stats", FAKE_WITH_STATS);
+        let mut session = Session::spawn(
+            &cli.bin(),
+            &["--mode".to_string(), "rpc".to_string()],
+            &[],
+            ".",
+        )
+        .unwrap();
+        session.init(Duration::from_secs(5)).await.unwrap();
+        let mut handler = CancelHandler;
+        let outcome = session
+            .turn("go", Duration::from_secs(5), &mut handler, None)
+            .await
+            .unwrap();
+        assert_eq!(outcome.text, "hello from gate");
+        let usage = outcome.usage.expect("get_session_stats was answered");
+        assert_eq!(usage.input, 1200);
+        assert_eq!(usage.output, 300);
+        assert_eq!(usage.cache_read, 4000);
+        assert_eq!(usage.cache_write, 50);
+        assert_eq!(usage.total, 5550);
+        // 0.0123456 USD rounds to 12_346 micro-USD.
+        assert_eq!(usage.cost_micros, 12_346);
+        session.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_pi_that_ignores_get_session_stats_still_finishes_the_turn() {
+        // The plain fake never answers the stats request; the turn must still
+        // settle with `usage: None` rather than hanging or failing.
+        let cli = FakeCli::new("rpc-no-stats", &spam());
+        let mut session = Session::spawn(
+            &cli.bin(),
+            &["--mode".to_string(), "rpc".to_string()],
+            &[],
+            ".",
+        )
+        .unwrap();
+        session.init(Duration::from_secs(5)).await.unwrap();
+        let mut handler = CancelHandler;
+        let outcome = session
+            .turn("go", Duration::from_secs(5), &mut handler, None)
+            .await
+            .unwrap();
+        assert_eq!(outcome.text, "hello from gate");
+        assert_eq!(outcome.usage, None);
+        session.shutdown().await;
     }
 
     #[tokio::test]

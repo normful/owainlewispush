@@ -122,6 +122,7 @@ impl Runner {
         Ok(RunOutput {
             reply: final_reply("pi", &reply)?,
             session_id: req.is_new.then_some(parsed.session_id).flatten(),
+            usage: None,
         })
     }
 

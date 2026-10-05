@@ -127,6 +127,7 @@ impl Runner {
         Ok(RunOutput {
             reply: final_reply("codex", &reply)?,
             session_id,
+            usage: None,
         })
     }
 
